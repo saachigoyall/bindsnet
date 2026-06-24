@@ -2321,14 +2321,14 @@ test = ["flake8", "matplotlib", "nbdime", "nbval", "notebook", "pytest"]
 
 [[package]]
 name = "mistune"
-version = "3.3.1"
+version = "3.3.2"
 description = "A sane and fast Markdown parser with useful plugins and renderers"
 optional = false
 python-versions = ">=3.8"
 groups = ["dev"]
 files = [
-    {file = "mistune-3.3.1-py3-none-any.whl", hash = "sha256:61c4ca5f8c1e0f4622e85bdec00ebf93942a742123bb26440a737bac0edce5c6"},
-    {file = "mistune-3.3.1.tar.gz", hash = "sha256:7d2108b532850ab81d3e92a5566abe1168f4f27c0c9dbe914e02d1d06e2a0288"},
+    {file = "mistune-3.3.2-py3-none-any.whl", hash = "sha256:a678a56387d487db7368ede4647cb2ba1deff22ce61f92343e4ebe0ddfce4f2d"},
+    {file = "mistune-3.3.2.tar.gz", hash = "sha256:e12ee4f1e74336e91aa1141e35f913b337c40bdf7c0cc49f21fb853a27e8b62f"},
 ]
 
 [[package]]
@@ -4076,14 +4076,14 @@ files = [
 
 [[package]]
 name = "scikit-build"
-version = "0.19.0"
+version = "0.19.1"
 description = "Improved build system generator for Python C/C++/Fortran/Cython extensions"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "scikit_build-0.19.0-py3-none-any.whl", hash = "sha256:956d1a179917e3994cb425662bb9e0ec052ef497995ce8e3f15b4030e02c5b94"},
-    {file = "scikit_build-0.19.0.tar.gz", hash = "sha256:46e1b2d71343d14e4c07d7e60902e673c78defb9a2c282b70ad80fb8502ade2e"},
+    {file = "scikit_build-0.19.1-py3-none-any.whl", hash = "sha256:a4fa78a7222ca40d5e8bae6700514bbf7efea4346efd9fc1f8cfca837cd1de71"},
+    {file = "scikit_build-0.19.1.tar.gz", hash = "sha256:b9a8d07fca2d5d10d93220bc57a685161d72af1fc76285d55c564ddaa862e584"},
 ]
 
 [package.dependencies]
