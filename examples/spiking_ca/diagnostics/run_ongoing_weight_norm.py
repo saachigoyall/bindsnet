@@ -96,7 +96,7 @@ for target_rate in TARGET_RATES:
         per_seed = {}
         for seed in [1, 2, 3]:
             _, (X, y) = run_with_ongoing_norm(seed, target_rate, 150, decode=True)
-            per_seed[seed] = {'Xhid': X, 'y': y}
+            per_seed[seed] = {'Xhid': np.array(X).tolist(), 'y': y}
         results[str(target_rate)] = per_seed
 
 if DECODE:
