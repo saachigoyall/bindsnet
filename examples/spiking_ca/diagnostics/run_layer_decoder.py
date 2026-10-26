@@ -9,7 +9,8 @@ about learning, the reward, or whether the architecture can solve CartPole.
 import json, sys
 import numpy as np
 from ca_model import build_network
-from probe import POLE_ANGLE_CELLS, cell_rows, fresh_grid, probe_layers, sample_state
+from probe import (POLE_ANGLE_CELLS, assert_cells_independent, cell_rows, fresh_grid,
+                   probe_layers, sample_state)
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 150
 SEEDS = [int(s) for s in sys.argv[2:]] or [1, 2, 3]
@@ -23,6 +24,7 @@ for seed in SEEDS:
     for _ in range(N):
         obs, label = sample_state(rng)
         inp, hid = probe_layers(fresh_grid(obs), net)
+        assert_cells_independent(hid)
         Xin.append(inp[rows].flatten().numpy())
         Xhid.append(hid[rows].flatten().numpy())
         y.append(label)

@@ -61,10 +61,15 @@ def probe_layers_power(grid, network, power, n_timesteps=50):
     reset_network(network)
     inp = torch.zeros(N_CELLS, 54)
     hid = torch.zeros(N_CELLS, network.layers['hidden'].n)
-    for t in range(n_timesteps):
-        inp += spikes[t]
-        network.run(inputs={'input': spikes[t]}, time=1, reward=0.0)
-        hid += network.layers['hidden'].s.float()
+    was_learning = network.learning
+    network.learning = False            # MSTDPET only runs at batch size 1
+    try:
+        for t in range(n_timesteps):
+            inp += spikes[t]
+            network.run(inputs={'input': spikes[t].unsqueeze(0)}, time=1, reward=0.0)
+            hid += network.layers['hidden'].s.float().reshape(N_CELLS, -1)
+    finally:
+        network.learning = was_learning
     return inp, hid
 
 

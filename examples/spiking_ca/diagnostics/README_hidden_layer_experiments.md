@@ -1,3 +1,19 @@
+> **Correction (Oct 2026): the hidden layer numbers in this file are invalid.**
+> Hazan found that `probe_layers` and `ca_step` passed a (256, 54) tensor to
+> `network.run`, which BindsNET reads as [time, neurons]. With `time=1` only
+> row 0 (the corner cell) ran, and its response was copied to all 256 cells, so
+> the hidden layer never saw the pole angle. The probes are fixed in `probe.py`,
+> `ca_model.py` and `run_encoder_baseline.py` (input is now [1, 256, 54]) and
+> `probe.assert_cells_independent` fails if every cell responds identically.
+> Reruns with the fix: encoder power 3 reaches about 0.77 on the decoder
+> (power 2: 0.72, power 4: 0.70, unmodified baseline: 0.56), reproduced by
+> `run_encoder_baseline.py --decode`. Hazan reports the other four experiments
+> at 0.49 to 0.61 (chance) after the fix; those reruns are not yet reproduced
+> here. The per experiment results below were produced with the bug and should
+> not be read as findings. The training loop in `spiking_ca_cluster.py` has the
+> same bug and is not yet changed, pending a decision on how the 256 cells share
+> one MSTDPET update.
+
 # Hidden layer experiments: five approaches to the saturated hidden layer
 
 This is a follow up to `README.md` in this folder, which found that pole

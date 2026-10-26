@@ -32,11 +32,28 @@ def probe_layers(grid, network, n_timesteps=50):
     reset_network(network)
     inp = torch.zeros(N_CELLS, 54)
     hid = torch.zeros(N_CELLS, network.layers['hidden'].n)
-    for t in range(n_timesteps):
-        inp += spikes[t]
-        network.run(inputs={'input': spikes[t]}, time=1, reward=0.0)
-        hid += network.layers['hidden'].s.float()
+    was_learning = network.learning
+    network.learning = False            # MSTDPET only runs at batch size 1
+    try:
+        for t in range(n_timesteps):
+            inp += spikes[t]
+            # BindsNET reads a 2D input as [time, neurons]. The 256 cells must
+            # be the BATCH dimension, so the input has to be [1, 256, 54].
+            network.run(inputs={'input': spikes[t].unsqueeze(0)}, time=1, reward=0.0)
+            hid += network.layers['hidden'].s.float().reshape(N_CELLS, -1)
+    finally:
+        network.learning = was_learning
     return inp, hid
+
+
+def assert_cells_independent(hid, name='hidden'):
+    """Fail loudly if every cell has the same response. This is the check that
+    would have caught the batch dimension bug: with the bug, all 256 rows of
+    the hidden spike counts were identical (copies of the corner cell)."""
+    n_distinct = len(torch.unique(hid, dim=0))
+    assert n_distinct > 1, (f'{name} layer: all {hid.shape[0]} cells have identical '
+                            f'responses; the cells are not being run independently')
+    return n_distinct
 
 
 def fresh_grid(obs):

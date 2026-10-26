@@ -155,6 +155,10 @@ def reset_network(network):
         layer.s = torch.zeros_like(layer.s)
 
 def ca_step(grid, network, reward=0.0, learn=False):
+    if learn:
+        raise NotImplementedError('MSTDPET runs only at batch size 1; how the 256 '
+                                  'cells share one weight update is still undecided')
+    network.learning = False
     n_cells = GRID_SIZE * GRID_SIZE
     all_neighbourhoods = []
     for r in range(GRID_SIZE):
@@ -174,8 +178,10 @@ def ca_step(grid, network, reward=0.0, learn=False):
     for t in range(50):
         spike_t = all_spikes_t[t]
         r = reward if learn and t == 49 else 0.0
-        network.run(inputs={'input': spike_t}, time=1, reward=r)
-        step_out = network.layers['output'].s.float()
+        # [1, 256, 54]: the 256 cells are the batch dimension (a 2D input would
+        # be read as [time, neurons] and run only row 0).
+        network.run(inputs={'input': spike_t.unsqueeze(0)}, time=1, reward=r)
+        step_out = network.layers['output'].s.float().reshape(n_cells, -1)
         output_counts += step_out
         output_spike_sum += step_out.sum(dim=0)
         hidden_spike_sum += network.layers['hidden'].s.float().sum().item()
@@ -215,15 +221,16 @@ def probe_layer_responses(grid, network, n_timesteps=50):
     all_spikes = torch.stack([encoder(flat_rates[i]) for i in range(n_cells)])
     all_spikes_t = all_spikes.permute(1, 0, 2)
     reset_network(network)
+    network.learning = False
     input_total = torch.zeros(54)
     hidden_total = torch.zeros(32)
     output_total = torch.zeros(12)
     for t in range(n_timesteps):
         spike_t = all_spikes_t[t]
         input_total += spike_t.sum(dim=0)
-        network.run(inputs={'input': spike_t}, time=1, reward=0.0)
-        hidden_total += network.layers['hidden'].s.float().sum(dim=0)
-        output_total += network.layers['output'].s.float().sum(dim=0)
+        network.run(inputs={'input': spike_t.unsqueeze(0)}, time=1, reward=0.0)
+        hidden_total += network.layers['hidden'].s.float().reshape(n_cells, -1).sum(dim=0)
+        output_total += network.layers['output'].s.float().reshape(n_cells, -1).sum(dim=0)
     return (input_total, hidden_total, output_total)
 
 def run_state_response_probe(net, obs, n_developmental=10, n_inference=3):
