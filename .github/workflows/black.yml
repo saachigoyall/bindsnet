@@ -1,11 +1,36 @@
+# Formatting and import-order check. Branch protection on master requires the job named "lint"; keep that name.
 name: Black Formater
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-      - uses: psf/black@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      # Use the black and isort versions pinned in poetry.lock, so CI and local
+      # formatting agree.
+      - name: Check formatting with black
+        run: |
+          version=$(python -c "import tomllib; print(next(p['version'] for p in tomllib.load(open('poetry.lock','rb'))['package'] if p['name']=='black'))")
+          pipx run "black==${version}" --check --diff .
+      - name: Check import order with isort
+        run: |
+          version=$(python -c "import tomllib; print(next(p['version'] for p in tomllib.load(open('poetry.lock','rb'))['package'] if p['name']=='isort'))")
+          pipx run "isort==${version}" --check-only --diff .

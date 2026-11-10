@@ -1,6 +1,6 @@
-<p align="center"><img width="25%" src="docs/logo.png"/></p>
+<p align="center"><img width="25%" src="https://raw.githubusercontent.com/BindsNET/bindsnet/master/docs/logo.png"/></p>
 
-A Python package used for simulating spiking neural networks (SNNs) on CPUs or GPUs using [PyTorch](http://pytorch.org/) `Tensor` functionality.
+A Python package used for simulating spiking neural networks (SNNs) on CPUs or GPUs using [PyTorch](https://pytorch.org/) `Tensor` functionality.
 
 BindsNET is a spiking neural network simulation library geared towards the development of biologically inspired algorithms for machine learning.
 
@@ -9,6 +9,7 @@ This package is used as part of ongoing research on applying SNNs, machine learn
 
 Check out the [BindsNET examples](https://github.com/BindsNET/bindsnet/tree/master/examples) for a collection of experiments, functions for the analysis of results, plots of experiment outcomes, and more. Documentation for the package can be found [here](https://bindsnet-docs.readthedocs.io).
 
+[![PyPI](https://img.shields.io/pypi/v/bindsnet.svg?cacheSeconds=3600)](https://pypi.org/project/bindsnet/)
 [![Build Status](https://github.com/BindsNET/bindsnet/actions/workflows/python-app.yml/badge.svg?branch=master)](https://github.com/BindsNET/bindsnet/actions/workflows/python-app.yml)
 [![CodeQL](https://github.com/BindsNET/bindsnet/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/BindsNET/bindsnet/actions/workflows/github-code-scanning/codeql)
 [![Documentation Status](https://readthedocs.org/projects/bindsnet-docs/badge/?version=latest)](https://bindsnet-docs.readthedocs.io/?badge=latest)
@@ -32,7 +33,13 @@ poetry install
 Alternatively, the provided `Dockerfile` builds the full pinned stack (see *Using Docker* below).
 
 ## Using Pip
-To install the most recent stable release from the GitHub repository
+To install the latest release from [PyPI](https://pypi.org/project/bindsnet/)
+
+```
+pip install bindsnet
+```
+
+To install the current development code from the GitHub repository
 
 ```
 pip install git+https://github.com/BindsNET/bindsnet.git
@@ -50,28 +57,24 @@ Or, to install in editable mode (allows modification of package without re-insta
 pip install -e .
 ```
 
-To install the packages necessary to interface with the [OpenAI gym RL environments library](https://github.com/openai/gym), follow their instructions for installing the packages needed to run the RL environments simulator (on Linux / MacOS).
+The reinforcement-learning environments use [Gymnasium](https://gymnasium.farama.org/) with the Arcade Learning Environment ([ale-py](https://github.com/Farama-Foundation/Arcade-Learning-Environment)); both are installed with BindsNET.
 
 ### Using Docker
-[Link](https://hub.docker.com/r/hqkhan/bindsnet/) to Docker repository.
-
-We also provide a Dockerfile in which BindsNET and all of its dependencies come installed in. Issue
-
-```
-docker build .
-```
-at the top level directory of this project to create a docker image. 
-
-To change the name of the newly built image, issue
-```
-docker tag <IMAGE_ID> <NEW_IMAGE_ID>
-```
-
-To run a container and get a bash terminal inside it, issue
+The `Dockerfile` installs BindsNET with the dependency versions pinned in `poetry.lock`.
+From the top level directory of this project, issue
 
 ```
-docker run -it <NEW_IMAGE_ID> bash
+docker build -t bindsnet .
 ```
+
+(add `--build-arg DEPS=main` to leave out the development tools). To get a bash
+terminal inside a container, issue
+
+```
+docker run --rm -it --gpus all bindsnet bash
+```
+
+`--gpus all` needs the NVIDIA Container Toolkit; leave it out to run on CPU only.
 
 ## Getting started
 
@@ -86,6 +89,13 @@ There are a number of optional command-line arguments which can be passed in, in
 
 A number of other examples are available in the `examples` directory that are meant to showcase BindsNET's functionality. Take a look, and let us know what you think!
 
+## Learning rules and their sources
+
+Each weight-changing rule is validated against the equations of the paper it
+implements. The table of rules, papers, equation numbers and tests, plus the pitfalls
+(reward timing, traces, the Diehl & Cook rule versus `PostPre`), is in
+[`bindsnet/learning/README.md`](https://github.com/BindsNET/bindsnet/blob/master/bindsnet/learning/README.md).
+
 ## Running the tests
 
 Issue the following to run the tests:
@@ -94,46 +104,52 @@ Issue the following to run the tests:
 python -m pytest test/
 ```
 
-Some tests will fail if Open AI `gym` is not installed on your machine.
-
 ## Datasets
 
 BindsNET ships no third-party datasets; its loaders fetch them from upstream sources.
 Every dataset and synthetic stimulus used by the examples, benchmarks, and dataset
 loaders — with source, retrieval method, license pointer, and spike-encoding
-preprocessing — is declared in [DATA.md](DATA.md).
+preprocessing — is declared in [DATA.md](https://github.com/BindsNET/bindsnet/blob/master/DATA.md).
 
 ## Reproducing results
 
-[REPRODUCING.md](REPRODUCING.md) maps each shipped model and published claim to its
-model class, example script, exact command, seed, and expected output (e.g. the
+[REPRODUCING.md](https://github.com/BindsNET/bindsnet/blob/master/REPRODUCING.md) maps each shipped model and published claim to its
+model class, example script, exact command, seed, and measured output (e.g. the
 Diehl & Cook 2015 MNIST replication via `examples/mnist/eth_mnist.py`, and the
 Hazan et al. 2018 scaling benchmark).
 
+Each BindsNET release is an archived snapshot. BindsNET is a research package that
+keeps gaining features and fixes, and results can also depend on the hardware, so
+results may differ between releases. A published result is reproduced with the
+release it was produced on; please name that release in the publication, ideally by
+its version DOI (see [Citing the software](#citing-the-software)).
+
 ## Background
 
-The simulation of biologically plausible spiking neuron dynamics can be challenging. It is typically done by solving ordinary differential equations (ODEs) which describe said dynamics. PyTorch does not explicitly support the solution of differential equations (as opposed to [`brian2`](https://github.com/brian-team/brian2), for example), but we can convert the ODEs defining the dynamics into difference equations and solve them at regular, short intervals (a `dt` on the order of 1 millisecond) as an approximation. Of course, under the hood, packages like `brian2` are doing the same thing. Doing this in [`PyTorch`](http://pytorch.org/) is exciting for a few reasons:
+The simulation of biologically plausible spiking neuron dynamics can be challenging. It is typically done by solving ordinary differential equations (ODEs) which describe said dynamics. PyTorch does not explicitly support the solution of differential equations (as opposed to [`brian2`](https://github.com/brian-team/brian2), for example), but we can convert the ODEs defining the dynamics into difference equations and solve them at regular, short intervals (a `dt` on the order of 1 millisecond) as an approximation. Of course, under the hood, packages like `brian2` are doing the same thing. Doing this in [`PyTorch`](https://pytorch.org/) is exciting for a few reasons:
 
-1. We can use the powerful and flexible [`torch.Tensor`](http://pytorch.org/) object, a wrapper around the [`numpy.ndarray`](https://docs.scipy.org/doc/numpy-1.13.0/reference/generated/numpy.ndarray.html) which can be transferred to and from GPU devices.
+1. We can use the powerful and flexible [`torch.Tensor`](https://pytorch.org/docs/stable/tensors.html) object, an array similar to the [`numpy.ndarray`](https://numpy.org/doc/stable/reference/generated/numpy.ndarray.html) that can be moved to and from GPU devices.
 
-2. We can avoid "reinventing the wheel" by repurposing functions from the [`torch.nn.functional`](http://pytorch.org/docs/master/nn.html#torch-nn-functional) PyTorch submodule in our SNN architectures; e.g., convolution or pooling functions.
+2. We can avoid "reinventing the wheel" by repurposing functions from the [`torch.nn.functional`](https://pytorch.org/docs/stable/nn.functional.html) PyTorch submodule in our SNN architectures; e.g., convolution or pooling functions.
 
-The concept that the neuron spike ordering and their relative timing encode information is a central theme in neuroscience. [Markram et al. (1997)](http://www.caam.rice.edu/~caam415/lec_gab/g4/markram_etal98.pdf) proposed that synapses between neurons should strengthen or degrade based on this relative timing, and prior to that, [Donald Hebb](https://en.wikipedia.org/wiki/Donald_O._Hebb) proposed the theory of Hebbian learning, often simply stated as "Neurons that fire together, wire together." Markram et al.'s extension of the Hebbian theory is known as spike-timing-dependent plasticity (STDP).
+The concept that the neuron spike ordering and their relative timing encode information is a central theme in neuroscience. [Markram et al. (1997)](https://doi.org/10.1126/science.275.5297.213) proposed that synapses between neurons should strengthen or degrade based on this relative timing, and prior to that, [Donald Hebb](https://en.wikipedia.org/wiki/Donald_O._Hebb) proposed the theory of Hebbian learning, often simply stated as "Neurons that fire together, wire together." Markram et al.'s extension of the Hebbian theory is known as spike-timing-dependent plasticity (STDP).
 
 We are interested in applying SNNs to ML and RL problems. We use STDP to modify weights of synapses connecting pairs or populations of neurons in SNNs. In the context of ML, we want to learn a setting of synapse weights which will generate data-dependent spiking activity in SNNs. This activity will allow us to subsequently perform some ML task of interest; e.g., discriminating or clustering input data. In the context of RL, we may think of the spiking neural network as an RL agent, whose spiking activity may be converted into actions in an environment's action space.
 
-We have provided some simple starter scripts for doing unsupervised learning (learning a fully-connected or convolutional representation via STDP), supervised learning (clamping output neurons to desired spiking behavior depending on data labels), and reinforcement learning (converting observations from the Atari game Space Invaders to input to an SNN, and converting network activity back to actions in the game).
+We have provided some simple starter scripts for doing unsupervised learning (learning a fully-connected or convolutional representation via STDP), supervised learning (clamping output neurons to desired spiking behavior depending on data labels), and reinforcement learning (converting observations from the Atari game Breakout to input to an SNN, and converting network activity back to actions in the game; see `examples/breakout`).
 
 ## Benchmarking
 We simulated a network with a population of n Poisson input neurons with firing rates (in Hertz) drawn randomly from U(0, 100), connected all-to-all with a equally-sized population of leaky integrate-and-fire (LIF) neurons, with connection weights sampled from N(0,1). We varied n systematically from 250 to 10,000 in steps of 250, and ran each simulation with every library for 1,000ms with a time resolution dt = 1.0. We tested BindsNET (with CPU and GPU computation), BRIAN2, PyNEST (the Python interface to the NEST SLI interface that runs the C++NEST core simulator), ANNarchy (with CPU and GPU computation), and BRIAN2genn (the BRIAN2 front-end to the GeNN simulator).
 
 Several packages, including BRIAN and PyNEST, allow the setting of certain global preferences; e.g., the number of CPU threads, the number of OpenMP processes, etc. We chose these settings for our benchmark study in an attempt to maximize each library's speed, but note that BindsNET requires no setting of such options. Our approach, inheriting the computational model of PyTorch, appears to make the best use of the available hardware, and therefore makes it simple for practitioners to get the best performance from their system with the least effort.
 
+The figure above is the 2018 result. `examples/benchmark/benchmark.py` runs exactly the setup described above for BindsNET, BRIAN2, PyNEST and ANNarchy in one command (BindsNET alone: `examples/benchmark/bindsnet_scaling.py`), and [REPRODUCING.md](REPRODUCING.md#scaling-benchmark) lists the times measured with it. It replaces the script written in 2018, which used its own input settings for each simulator.
+
 <p align="middle">
-<img src="https://github.com/Hananel-Hazan/bindsnet/blob/master/docs/BindsNET%20benchmark.png" alt="BindsNET%20Benchmark"  width="503" height="403">
+<img src="https://raw.githubusercontent.com/BindsNET/bindsnet/master/docs/BindsNET%20benchmark.png" alt="BindsNET%20Benchmark"  width="503" height="403">
 </p>
 
-All simulations run on Ubuntu 16.04 LTS with Intel(R) Xeon(R) CPU E5-2687W v3 @ 3.10GHz, 128Gb RAM @ 2133MHz, and two GeForce GTX TITAN X (GM200) GPUs. Python 3.6 is used in all cases. Clock time was recorded for each simulation run. 
+These results are from the 2018 BindsNET paper. All simulations run on Ubuntu 16.04 LTS with Intel(R) Xeon(R) CPU E5-2687W v3 @ 3.10GHz, 128Gb RAM @ 2133MHz, and two GeForce GTX TITAN X (GM200) GPUs. Python 3.6 is used in all cases. Clock time was recorded for each simulation run. 
 
 ## Citation
 
@@ -162,8 +178,10 @@ The concept DOI below always resolves to the latest version:
 > BindsNET contributors. *BindsNET*. Zenodo. https://doi.org/10.5281/zenodo.20695115
 
 (For the exact release used, cite its version DOI; e.g. v0.3.4 is
-[10.5281/zenodo.20695116](https://doi.org/10.5281/zenodo.20695116).) A machine-readable
-citation is provided in [`CITATION.cff`](CITATION.cff).
+[10.5281/zenodo.20695116](https://doi.org/10.5281/zenodo.20695116). That archive is the
+GitHub tag `0.3.4`; the PyPI package `bindsnet==0.3.4` was built later and also
+contains the changes listed in `CHANGELOG.md` under 0.3.4 (PyPI).) A machine-readable
+citation is provided in [`CITATION.cff`](https://github.com/BindsNET/bindsnet/blob/master/CITATION.cff).
 
 ## Contributors
 

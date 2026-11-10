@@ -1,9 +1,9 @@
-from abc import ABC, abstractmethod
-from typing import Union, Optional, Sequence
 import warnings
+from abc import ABC, abstractmethod
+from typing import Optional, Sequence, Union
 
-import torch
 import numpy as np
+import torch
 
 from ..network.nodes import SRM0Nodes
 from ..network.topology import (
@@ -11,6 +11,57 @@ from ..network.topology import (
     MulticompartmentConnection,
 )
 from ..utils import im2col_indices
+
+
+def _dense_outer_update_ok(rule, w: torch.Tensor) -> bool:
+    # language=rst
+    """
+    Whether a rule's ``[batch, source.n] x [batch, target.n]`` outer-product
+    update can be applied with a single fused ``w.addmm_`` call: dense float32
+    weights and one of the two default batch reductions (``torch.squeeze`` for
+    batch size 1, ``torch.sum`` otherwise), both equal to the matrix product's
+    contraction over the batch dimension.
+    """
+    return (
+        isinstance(w, torch.Tensor)
+        and not w.is_sparse
+        and w.dtype == torch.float32
+        and rule.reduction in (torch.squeeze, torch.sum)
+    )
+
+
+def _reduce_batch(reduction, x: torch.Tensor) -> torch.Tensor:
+    # language=rst
+    """
+    Reduce per-sample updates ``x`` (``[batch, ...]``) over the batch. The default
+    ``torch.squeeze`` (chosen for batch size 1) means a sum over a larger batch, as
+    in the fused dense path; for one sample both are exact.
+    """
+    return x.sum(0) if reduction is torch.squeeze else reduction(x, dim=0)
+
+
+def _add_to_feature(value: torch.Tensor, update: torch.Tensor) -> None:
+    # language=rst
+    """
+    ``value += update`` for a batch-reduced ``update``. A sparse value holds one
+    weight copy per sample (``[batch, src, tgt]``); every copy gets the same update,
+    so sparse weights learn as the dense (shared) weights do.
+    """
+    if value.is_sparse:
+        update = update.expand(value.shape).to_sparse()
+    value += update
+
+
+def _batch_outer(a: torch.Tensor, b: torch.Tensor, reduction) -> torch.Tensor:
+    # language=rst
+    """
+    ``reduction(bmm(a[:, :, None], b[:, None, :]), dim=0)``: the batch of outer
+    products of ``a`` (``[batch, n]``) and ``b`` (``[batch, m]``) reduced over the
+    batch. For the two default reductions this is the single matmul ``a^T b``.
+    """
+    if reduction in (torch.squeeze, torch.sum):
+        return a.t() @ b
+    return reduction(torch.bmm(a.unsqueeze(2), b.unsqueeze(1)), dim=0)
 
 
 class MCC_LearningRule(ABC):
@@ -89,8 +140,9 @@ class MCC_LearningRule(ABC):
         Abstract method for a learning rule update.
         """
 
-        # Implement decay.
-        if self.decay:
+        # Implement decay (self.decay == 1.0 is the no-op default; skip the
+        # full-matrix multiply in that case).
+        if self.decay != 1.0:
             self.feature_value *= self.decay
 
         # Enforce polarities
@@ -103,7 +155,8 @@ class MCC_LearningRule(ABC):
             self, NoOp
         ):
             if self.feature_value.is_sparse:
-                self.feature_value = (
+                # In place: the feature (and compute()) holds this same tensor.
+                self.feature_value.copy_(
                     self.feature_value.to_dense().clamp_(self.min, self.max).to_sparse()
                 )
             else:
@@ -150,7 +203,9 @@ class PostPre(MCC_LearningRule):
     # language=rst
     """
     Simple STDP rule involving both pre- and post-synaptic spiking activity. By default,
-    pre-synaptic update is negative and the post-synaptic update is positive.
+    pre-synaptic update is negative and the post-synaptic update is positive. Same
+    equations as ``bindsnet.learning.PostPre`` (Morrison et al. 2008, eqs. 13-14): the
+    update is a per-spike increment and does not depend on the simulation step ``dt``.
     """
 
     def __init__(
@@ -228,6 +283,25 @@ class PostPre(MCC_LearningRule):
         class.
         """
         batch_size = self.source.batch_size
+        w = self.feature_value
+
+        if self.average_update == 0 and _dense_outer_update_ok(self, w):
+            # Fused path: ``w += alpha * s^T @ x`` folds the outer product, the
+            # batch reduction and the in-place update into one ``addmm_`` call,
+            # so no ``[batch, source.n, target.n]`` temporary is allocated. The
+            # learning rate is applied to the ``[batch, n]`` factor first (as in
+            # the un-fused formula) and spikes are exactly 0/1, so for batch
+            # size 1 the result is bit-identical.
+            if self.nu[0]:
+                source_s = self.source.s.view(batch_size, -1).float()
+                target_x = self.target.x.view(batch_size, -1) * self.nu[0]
+                w.addmm_(source_s.t(), target_x, alpha=-1.0)
+            if self.nu[1]:
+                target_s = self.target.s.view(batch_size, -1).float() * self.nu[1]
+                source_x = self.source.x.view(batch_size, -1)
+                w.addmm_(source_x.t(), target_s, alpha=1.0)
+            super().update()
+            return
 
         # Pre-synaptic update.
         if self.nu[0]:
@@ -244,22 +318,18 @@ class PostPre(MCC_LearningRule):
                 ) % self.average_update
 
                 if self.continues_update:
-                    self.feature_value -= (
-                        torch.mean(self.average_buffer_pre, dim=0) * self.connection.dt
-                    )
+                    self.feature_value -= torch.mean(self.average_buffer_pre, dim=0)
                 elif self.average_buffer_index_pre == 0:
-                    self.feature_value -= (
-                        torch.mean(self.average_buffer_pre, dim=0) * self.connection.dt
-                    )
+                    self.feature_value -= torch.mean(self.average_buffer_pre, dim=0)
             else:
                 if self.feature_value.is_sparse:
-                    self.feature_value -= (
-                        torch.bmm(source_s, target_x) * self.connection.dt
-                    ).to_sparse()
+                    _add_to_feature(
+                        self.feature_value,
+                        -_reduce_batch(self.reduction, torch.bmm(source_s, target_x)),
+                    )
                 else:
-                    self.feature_value -= (
-                        self.reduction(torch.bmm(source_s, target_x), dim=0)
-                        * self.connection.dt
+                    self.feature_value -= self.reduction(
+                        torch.bmm(source_s, target_x), dim=0
                     )
             del source_s, target_x
 
@@ -280,92 +350,110 @@ class PostPre(MCC_LearningRule):
                 ) % self.average_update
 
                 if self.continues_update:
-                    self.feature_value += (
-                        torch.mean(self.average_buffer_post, dim=0) * self.connection.dt
-                    )
+                    self.feature_value += torch.mean(self.average_buffer_post, dim=0)
                 elif self.average_buffer_index_post == 0:
-                    self.feature_value += (
-                        torch.mean(self.average_buffer_post, dim=0) * self.connection.dt
-                    )
+                    self.feature_value += torch.mean(self.average_buffer_post, dim=0)
             else:
                 if self.feature_value.is_sparse:
-                    self.feature_value += (
-                        torch.bmm(source_x, target_s) * self.connection.dt
-                    ).to_sparse()
+                    _add_to_feature(
+                        self.feature_value,
+                        _reduce_batch(self.reduction, torch.bmm(source_x, target_s)),
+                    )
                 else:
-                    self.feature_value += (
-                        self.reduction(torch.bmm(source_x, target_s), dim=0)
-                        * self.connection.dt
+                    self.feature_value += self.reduction(
+                        torch.bmm(source_x, target_s), dim=0
                     )
             del source_x, target_s
 
         super().update()
 
-    def reset_state_variables(self):
-        return
-
-    class Hebbian(MCC_LearningRule):
+    def reset_state_variables(self) -> None:
         # language=rst
         """
-        Simple Hebbian learning rule. Pre- and post-synaptic updates are both positive.
+        Clear the moving-average buffers so a new episode does not average over
+        updates accumulated during the previous one.
         """
 
-        def __init__(
-            self,
-            connection: AbstractMulticompartmentConnection,
-            feature_value: Union[torch.Tensor, float, int],
-            nu: Optional[Union[float, Sequence[float]]] = None,
-            reduction: Optional[callable] = None,
-            decay: float = 0.0,
-            **kwargs,
-        ) -> None:
-            # language=rst
-            """
-            Constructor for ``Hebbian`` learning rule.
+        if self.average_update > 0:
+            self.average_buffer_pre.zero_()
+            self.average_buffer_post.zero_()
+            self.average_buffer_index_pre = 0
+            self.average_buffer_index_post = 0
 
-            :param connection: An ``AbstractConnection`` object whose weights the
-                ``Hebbian`` learning rule will modify.
-            :param nu: Single or pair of learning rates for pre- and post-synaptic events.
-            :param reduction: Method for reducing parameter updates along the batch
-                dimension.
-            :param decay: Coefficient controlling rate of decay of the weights each iteration.
-            """
-            super().__init__(
-                connection=connection,
-                feature_value=feature_value,
-                nu=nu,
-                reduction=reduction,
-                decay=decay,
-                **kwargs,
+
+class Hebbian(MCC_LearningRule):
+    # language=rst
+    """
+    Simple Hebbian learning rule. Pre- and post-synaptic updates are both positive.
+    """
+
+    def __init__(
+        self,
+        connection: AbstractMulticompartmentConnection,
+        feature_value: Union[torch.Tensor, float, int],
+        range: Optional[Sequence[float]] = None,
+        nu: Optional[Union[float, Sequence[float]]] = None,
+        reduction: Optional[callable] = None,
+        decay: float = 0.0,
+        **kwargs,
+    ) -> None:
+        # language=rst
+        """
+        Constructor for ``Hebbian`` learning rule.
+
+        :param connection: An ``AbstractConnection`` object whose weights the
+            ``Hebbian`` learning rule will modify.
+        :param nu: Single or pair of learning rates for pre- and post-synaptic events.
+        :param reduction: Method for reducing parameter updates along the batch
+            dimension.
+        :param decay: Coefficient controlling rate of decay of the weights each iteration.
+        """
+        super().__init__(
+            connection=connection,
+            feature_value=feature_value,
+            range=[-1, +1] if range is None else range,
+            nu=nu,
+            reduction=reduction,
+            decay=decay,
+            **kwargs,
+        )
+
+        assert (
+            self.source.traces and self.target.traces
+        ), "Both pre- and post-synaptic nodes must record spike traces."
+
+        if isinstance(connection, MulticompartmentConnection):
+            self.update = self._connection_update
+            self.feature_value = feature_value
+        # elif isinstance(connection, Conv2dConnection):
+        #     self.update = self._conv2d_connection_update
+        else:
+            raise NotImplementedError(
+                "This learning rule is not supported for this Connection type."
             )
 
-            assert (
-                self.source.traces and self.target.traces
-            ), "Both pre- and post-synaptic nodes must record spike traces."
+    def _connection_update(self, **kwargs) -> None:
+        # language=rst
+        """
+        Hebbian learning rule for ``Connection`` subclass of ``AbstractConnection``
+        class.
+        """
 
-            if isinstance(MulticompartmentConnection):
-                self.update = self._connection_update
-                self.feature_value = feature_value
-            # elif isinstance(connection, Conv2dConnection):
-            #     self.update = self._conv2d_connection_update
-            else:
-                raise NotImplementedError(
-                    "This learning rule is not supported for this Connection type."
-                )
+        # Add polarities back to feature after updates
+        if self.enforce_polarity:
+            self.feature_value = torch.abs(self.feature_value)
 
-        def _connection_update(self, **kwargs) -> None:
-            # language=rst
-            """
-            Hebbian learning rule for ``Connection`` subclass of ``AbstractConnection``
-            class.
-            """
+        batch_size = self.source.batch_size
 
-            # Add polarities back to feature after updates
-            if self.enforce_polarity:
-                self.feature_value = torch.abs(self.feature_value)
-
-            batch_size = self.source.batch_size
-
+        if _dense_outer_update_ok(self, self.feature_value):
+            # Fused path (see ``PostPre._connection_update``).
+            source_s = self.source.s.view(batch_size, -1).float()
+            source_x = self.source.x.view(batch_size, -1)
+            target_s = self.target.s.view(batch_size, -1).float()
+            target_x = self.target.x.view(batch_size, -1)
+            self.feature_value.addmm_(source_s.t(), target_x * self.nu[0], alpha=1.0)
+            self.feature_value.addmm_(source_x.t(), target_s * self.nu[1], alpha=1.0)
+        else:
             source_s = self.source.s.view(batch_size, -1).unsqueeze(2).float()
             source_x = self.source.x.view(batch_size, -1).unsqueeze(2)
             target_s = self.target.s.view(batch_size, -1).unsqueeze(1).float()
@@ -379,14 +467,121 @@ class PostPre(MCC_LearningRule):
             update = self.reduction(torch.bmm(source_x, target_s), dim=0)
             self.feature_value += self.nu[1] * update
 
-            # Add polarities back to feature after updates
-            if self.enforce_polarity:
-                self.feature_value = self.feature_value * self.polarities
+        # Add polarities back to feature after updates
+        if self.enforce_polarity:
+            self.feature_value = self.feature_value * self.polarities
 
+        super().update()
+
+    def reset_state_variables(self) -> None:
+        # language=rst
+        """
+        Nothing to reset: the rule holds no state between steps, deriving each
+        update from the layers' current spikes and traces.
+        """
+
+
+class DiehlAndCook(MCC_LearningRule):
+    # language=rst
+    """
+    Post-synaptic-spike-only STDP of `Diehl & Cook (2015)
+    <https://www.frontiersin.org/articles/10.3389/fncom.2015.00099/full>`_, Sect. 2.3:
+
+    .. math::
+
+        \\Delta w = \\eta\\,(x_\\text{pre} - x_\\text{tar})\\,(w_\\max - w)^\\mu
+
+    applied on every post-synaptic spike, with :math:`x_\\text{pre}` the source
+    spike trace (the paper's trace adds 1 per spike: use ``traces_additive=True``),
+    :math:`x_\\text{tar}` the target trace value, :math:`w_\\max` the upper end of
+    ``range``, and :math:`\\mu` the weight-dependence exponent. Pre-synaptic spikes do
+    not change the weight. Multicompartment twin of
+    ``bindsnet.learning.DiehlAndCook``.
+    """
+
+    def __init__(
+        self,
+        connection: AbstractMulticompartmentConnection,
+        feature_value: Union[torch.Tensor, float, int],
+        range: Optional[Sequence[float]] = None,
+        nu: Optional[Union[float, Sequence[float]]] = None,
+        reduction: Optional[callable] = None,
+        decay: float = 0.0,
+        **kwargs,
+    ) -> None:
+        # language=rst
+        """
+        Constructor for the ``DiehlAndCook`` learning rule.
+
+        :param connection: A ``MulticompartmentConnection`` whose weight feature the
+            rule will modify.
+        :param feature_value: The weight tensor.
+        :param range: ``[w_min, w_max]``; ``w_max`` must be finite.
+        :param nu: Learning rate :math:`\\eta`. A pair is accepted for API symmetry;
+            only the second (post-synaptic) entry is used.
+        :param reduction: Method for reducing parameter updates along the batch
+            dimension.
+        :param decay: Coefficient controlling rate of decay of the weights each iteration.
+
+        Keyword arguments:
+
+        :param float x_tar: Target pre-synaptic trace :math:`x_\\text{tar}` (default 0).
+        :param float mu: Weight-dependence exponent :math:`\\mu` (default 1).
+        """
+        super().__init__(
+            connection=connection,
+            feature_value=feature_value,
+            range=[0.0, 1.0] if range is None else range,
+            nu=nu,
+            reduction=reduction,
+            decay=decay,
+            **kwargs,
+        )
+
+        assert self.source.traces, "Pre-synaptic nodes must record spike traces."
+        assert self.max is not None and np.isfinite(
+            self.max
+        ), "DiehlAndCook needs a finite upper weight bound (range[1] = w_max)."
+
+        if isinstance(connection, MulticompartmentConnection):
+            self.update = self._connection_update
+        else:
+            raise NotImplementedError(
+                "This learning rule is not supported for this Connection type."
+            )
+
+        self.x_tar = float(kwargs.get("x_tar", 0.0))
+        self.mu = float(kwargs.get("mu", 1.0))
+
+    def _connection_update(self, **kwargs) -> None:
+        # language=rst
+        """
+        ``w += eta * ((x_pre - x_tar) outer s_post) * (w_max - w) ** mu`` reduced
+        over the batch.
+        """
+        if not self.nu[1]:
             super().update()
-
-        def reset_state_variables(self):
             return
+        batch_size = self.source.batch_size
+        w = self.feature_value
+        source_x = self.source.x.view(batch_size, -1) - self.x_tar
+        target_s = self.target.s.view(batch_size, -1).float()
+        outer = _batch_outer(source_x, target_s, self.reduction)
+        factor = self.max - (w.to_dense() if w.is_sparse else w)
+        if self.mu != 1.0:
+            factor = factor.clamp(min=0.0) ** self.mu
+        if w.is_sparse:
+            _add_to_feature(w, self.nu[1] * outer * factor)
+        else:
+            w += self.nu[1] * outer * factor
+        super().update()
+
+    def reset_state_variables(self) -> None:
+        # language=rst
+        """
+        Nothing to reset: the rule holds no state between steps, deriving each
+        update from the source trace, the target spikes and the current weight.
+        """
 
 
 class MSTDP(MCC_LearningRule):
@@ -453,6 +648,17 @@ class MSTDP(MCC_LearningRule):
         self.tc_plus = torch.tensor(kwargs.get("tc_plus", 20.0))
         self.tc_minus = torch.tensor(kwargs.get("tc_minus", 20.0))
 
+        # State the update path fills in lazily, because it needs the batch
+        # size and device that only the first update knows: P+/P-, the previous
+        # step's spikes kept by the fast path for its rank-1 update, and the
+        # dense path's eligibility. None means "not built yet", which is also
+        # the state ``reset_state_variables`` restores.
+        self.p_plus = None
+        self.p_minus = None
+        self._prev_source_s = None
+        self._prev_target_s = None
+        self.eligibility = None
+
         # Initialize variables for average update and continues update
         self.average_update = kwargs.get("average_update", 0)
         self.continues_update = kwargs.get("continues_update", False)
@@ -474,81 +680,154 @@ class MSTDP(MCC_LearningRule):
 
         :param Union[float, torch.Tensor] reward: Reward signal from reinforcement
         learning task.
+            A per-sample reward has shape ``[batch, 1, 1]``.
         :param float a_plus: Learning rate (post-synaptic).
         :param float a_minus: Learning rate (pre-synaptic).
         """
         batch_size = self.source.batch_size
 
         # Initialize eligibility, P^+, and P^-.
-        if not hasattr(self, "p_plus"):
+        if self.p_plus is None:
             self.p_plus = torch.zeros(
                 # batch_size, *self.source.shape, device=self.source.s.device
                 batch_size,
                 self.source.n,
                 device=self.source.s.device,
             )
-        if not hasattr(self, "p_minus"):
+        if self.p_minus is None:
             self.p_minus = torch.zeros(
                 # batch_size, *self.target.shape, device=self.target.s.device
                 batch_size,
                 self.target.n,
                 device=self.target.s.device,
             )
-        if not hasattr(self, "eligibility"):
-            self.eligibility = torch.zeros(
-                batch_size, *self.feature_value.shape, device=self.feature_value.device
-            )
-
         # Reshape pre- and post-synaptic spikes.
         source_s = self.source.s.view(batch_size, -1).float()
         target_s = self.target.s.view(batch_size, -1).float()
 
-        # Parse keyword arguments.
+        # Reward from current time step
         reward = kwargs["reward"]
-        a_plus = torch.tensor(
-            kwargs.get("a_plus", 1.0), device=self.feature_value.device
+
+        # Build learning-rate and decay tensors, cached on (dt, device) so a
+        # change to either (network.dt edits, .to(device) moves) recomputes them.
+        dev = self.feature_value.device
+        dt = float(self.connection.dt)
+        if getattr(self, "_decay_key", None) != (dt, dev):
+            self._decay_key = (dt, dev)
+            self._a_plus_default = torch.tensor(1.0, device=dev)
+            self._a_minus_default = torch.tensor(-1.0, device=dev)
+            self._decay_plus = torch.exp(-dt / self.tc_plus.to(dev))
+            self._decay_minus = torch.exp(-dt / self.tc_minus.to(dev))
+        a_plus = kwargs.get("a_plus", None)
+        a_plus = (
+            self._a_plus_default
+            if a_plus is None
+            else torch.as_tensor(a_plus, device=self.feature_value.device)
         )
-        a_minus = torch.tensor(
-            kwargs.get("a_minus", -1.0), device=self.feature_value.device
+        a_minus = kwargs.get("a_minus", None)
+        a_minus = (
+            self._a_minus_default
+            if a_minus is None
+            else torch.as_tensor(a_minus, device=self.feature_value.device)
         )
 
-        # Compute weight update based on the eligibility value of the past timestep.
-        update = reward * self.eligibility
+        # With no averaging and the standard batch reductions (squeeze for
+        # batch size 1, sum otherwise), the [batch, src, tgt] eligibility never
+        # needs to be materialized: its batch reduction is a sum of two matrix
+        # products applied to the weights directly. The eligibility of the past
+        # timestep is outer(p_plus, target_s) + outer(source_s, p_minus), with
+        # p_plus/p_minus still holding their previous-step values here.
+        fast = (
+            self.average_update == 0
+            and self.reduction in (torch.squeeze, torch.sum)
+            and not self.feature_value.is_sparse
+        )
+        if fast:
+            if self._prev_target_s is not None:
+                if isinstance(reward, torch.Tensor):
+                    # Keep reward on-device (no host sync for tensor rewards).
+                    update = (
+                        self.p_plus.t() @ self._prev_target_s
+                        + self._prev_source_s.t() @ self.p_minus
+                    )
+                    self.feature_value += (self.nu[0].to(dev) * reward) * update
+                else:
+                    alpha = float(self.nu[0]) * reward
+                    if alpha != 0.0:
+                        self.feature_value.addmm_(
+                            self.p_plus.t(), self._prev_target_s, alpha=alpha
+                        )
+                        self.feature_value.addmm_(
+                            self._prev_source_s.t(), self.p_minus, alpha=alpha
+                        )
+        else:
+            # Dense-eligibility path: averaging buffers, custom reductions, or
+            # sparse weights.
+            if self.eligibility is None:
+                self.eligibility = torch.zeros(
+                    batch_size,
+                    *self.feature_value.shape,
+                    device=self.feature_value.device,
+                )
 
-        if self.average_update > 0:
-            self.average_buffer[self.average_buffer_index] = self.reduction(
-                update, dim=0
-            )
-            self.average_buffer_index = (
-                self.average_buffer_index + 1
-            ) % self.average_update
+            # Compute weight update based on the eligibility value of the past timestep.
+            update = reward * self.eligibility
 
-            if self.continues_update or self.average_buffer_index == 0:
-                update = self.nu[0] * torch.mean(self.average_buffer, dim=0)
+            if self.average_update > 0:
+                self.average_buffer[self.average_buffer_index] = self.reduction(
+                    update, dim=0
+                )
+                self.average_buffer_index = (
+                    self.average_buffer_index + 1
+                ) % self.average_update
+
+                if self.continues_update or self.average_buffer_index == 0:
+                    update = self.nu[0] * torch.mean(self.average_buffer, dim=0)
+                    if self.feature_value.is_sparse:
+                        update = update.to_sparse()
+                    self.feature_value += update
+            else:
+                update = self.nu[0] * self.reduction(update, dim=0)
                 if self.feature_value.is_sparse:
                     update = update.to_sparse()
                 self.feature_value += update
-        else:
-            update = self.nu[0] * self.reduction(update, dim=0)
-            if self.feature_value.is_sparse:
-                update = update.to_sparse()
-            self.feature_value += update
 
         # Update P^+ and P^- values.
-        self.p_plus *= torch.exp(-self.connection.dt / self.tc_plus)
+        self.p_plus *= self._decay_plus
         self.p_plus += a_plus * source_s
-        self.p_minus *= torch.exp(-self.connection.dt / self.tc_minus)
+        self.p_minus *= self._decay_minus
         self.p_minus += a_minus * target_s
 
-        # Calculate point eligibility value.
-        self.eligibility = torch.bmm(
-            self.p_plus.unsqueeze(2), target_s.unsqueeze(1)
-        ) + torch.bmm(source_s.unsqueeze(2), self.p_minus.unsqueeze(1))
+        if fast:
+            # Keep this step's spikes for the next step's rank-1 update.
+            self._prev_source_s = source_s.clone()
+            self._prev_target_s = target_s.clone()
+        else:
+            # Calculate point eligibility value.
+            self.eligibility = torch.bmm(
+                self.p_plus.unsqueeze(2), target_s.unsqueeze(1)
+            ) + torch.bmm(source_s.unsqueeze(2), self.p_minus.unsqueeze(1))
 
         super().update()
 
-    def reset_state_variables(self):
-        return
+    def reset_state_variables(self) -> None:
+        # language=rst
+        """
+        Clear every variable that carries across time steps, so a new episode
+        starts from the same state as a freshly-built rule.
+        """
+
+        for state in (self.eligibility, self.p_plus, self.p_minus):
+            if state is not None:
+                state.zero_()
+        if self.average_update > 0:
+            self.average_buffer.zero_()
+            self.average_buffer_index = 0
+        # The fast path keeps the previous step's spikes to build the next
+        # rank-1 update. Drop them, or the first step of a new episode pairs
+        # with the last step of the old one.
+        self._prev_source_s = None
+        self._prev_target_s = None
 
 
 class MSTDPET(MCC_LearningRule):
@@ -622,20 +901,11 @@ class MSTDPET(MCC_LearningRule):
         self.tc_e_trace = torch.tensor(
             kwargs.get("tc_e_trace", 25.0)
         )  # How long trace effects weights
-        self.eligibility = torch.zeros(
-            *self.feature_value.shape, device=self.feature_value.device
-        )
-        self.eligibility_trace = torch.zeros(
-            *self.feature_value.shape, device=self.feature_value.device
-        )
-
-        # Initialize eligibility, eligibility trace, P^+, and P^-.
-        if not hasattr(self, "p_plus"):
-            self.p_plus = torch.zeros((self.source.n), device=self.feature_value.device)
-        if not hasattr(self, "p_minus"):
-            self.p_minus = torch.zeros(
-                (self.target.n), device=self.feature_value.device
-            )
+        # Per-sample state ([batch, ...]), created on the first update.
+        self.p_plus = None
+        self.p_minus = None
+        self.eligibility = None
+        self.eligibility_trace = None
 
         # Initialize variables for average update and continues update
         self.average_update = kwargs.get("average_update", 0)
@@ -659,63 +929,81 @@ class MSTDPET(MCC_LearningRule):
 
         :param Union[float, torch.Tensor] reward: Reward signal from reinforcement
             learning task.
+            A per-sample reward has shape ``[batch, 1, 1]``.
         :param float a_plus: Learning rate (post-synaptic).
         :param float a_minus: Learning rate (pre-synaptic).
         """
         # Reshape pre- and post-synaptic spikes.
-        source_s = self.source.s.view(-1).float()
-        target_s = self.target.s.view(-1).float()
+        batch_size = self.source.batch_size
+        source_s = self.source.s.view(batch_size, -1).float()
+        target_s = self.target.s.view(batch_size, -1).float()
 
         # Parse keyword arguments.
         reward = kwargs["reward"]
-        a_plus = kwargs.get("a_plus", 1.0)
-        # if isinstance(a_plus, dict):
-        #     for k, v in a_plus.items():
-        #         a_plus[k] = torch.tensor(v, device=self.feature_value.device)
-        # else:
-        a_plus = torch.tensor(a_plus, device=self.feature_value.device)
-        a_minus = kwargs.get("a_minus", -1.0)
-        # if isinstance(a_minus, dict):
-        #     for k, v in a_minus.items():
-        #         a_minus[k] = torch.tensor(v, device=self.feature_value.device)
-        # else:
-        a_minus = torch.tensor(a_minus, device=self.feature_value.device)
+
+        dev = self.feature_value.device
+        if self.p_plus is None or self.p_plus.size(0) != batch_size:
+            n_pre, n_post = self.source.n, self.target.n
+            self.p_plus = torch.zeros(batch_size, n_pre, device=dev)
+            self.p_minus = torch.zeros(batch_size, n_post, device=dev)
+            self.eligibility = torch.zeros(batch_size, n_pre, n_post, device=dev)
+            self.eligibility_trace = torch.zeros(batch_size, n_pre, n_post, device=dev)
+
+        # Build learning-rate and decay tensors, cached on (dt, device) so a
+        # change to either (network.dt edits, .to(device) moves) recomputes them.
+        dt = float(self.connection.dt)
+        if getattr(self, "_decay_key", None) != (dt, dev):
+            self._decay_key = (dt, dev)
+            self._a_plus_default = torch.tensor(1.0, device=dev)
+            self._a_minus_default = torch.tensor(-1.0, device=dev)
+            self._decay_plus = torch.exp(-dt / self.tc_plus.to(dev))
+            self._decay_minus = torch.exp(-dt / self.tc_minus.to(dev))
+            self._decay_e_trace = torch.exp(-dt / self.tc_e_trace.to(dev))
+        a_plus = kwargs.get("a_plus", None)
+        a_plus = (
+            self._a_plus_default
+            if a_plus is None
+            else torch.as_tensor(a_plus, device=dev)
+        )
+        a_minus = kwargs.get("a_minus", None)
+        a_minus = (
+            self._a_minus_default
+            if a_minus is None
+            else torch.as_tensor(a_minus, device=dev)
+        )
 
         # Calculate value of eligibility trace based on the value
         # of the point eligibility value of the past timestep.
         # Note: eligibility = [source.n, target.n] > 0 where source and target spiked
         # Note: high negs. ->
-        self.eligibility_trace *= torch.exp(
-            -self.connection.dt / self.tc_e_trace
-        )  # Decay
+        self.eligibility_trace *= self._decay_e_trace  # Decay
         self.eligibility_trace += self.eligibility / self.tc_e_trace  # Additive changes
         # ^ Also effected by delay in last step
 
         # Compute weight update.
 
+        # Weights are shared across the batch: reduce the per-sample updates (a
+        # sparse value's per-sample copies all get the same update).
+        update = self.nu[0] * self.connection.dt * reward * self.eligibility_trace
+        update = _reduce_batch(self.reduction, update)
+
         if self.average_update > 0:
-            self.average_buffer[self.average_buffer_index] = (
-                self.nu[0] * self.connection.dt * reward * self.eligibility_trace
-            )
+            self.average_buffer[self.average_buffer_index] = update
             self.average_buffer_index = (
                 self.average_buffer_index + 1
             ) % self.average_update
 
             if self.continues_update or self.average_buffer_index == 0:
-                update = torch.mean(self.average_buffer, dim=0)
-                if self.feature_value.is_sparse:
-                    update = update.to_sparse()
-                self.feature_value += update
+                _add_to_feature(
+                    self.feature_value, torch.mean(self.average_buffer, dim=0)
+                )
         else:
-            update = self.nu[0] * self.connection.dt * reward * self.eligibility_trace
-            if self.feature_value.is_sparse:
-                update = update.to_sparse()
-            self.feature_value += update
+            _add_to_feature(self.feature_value, update)
 
         # Update P^+ and P^- values.
-        self.p_plus *= torch.exp(-self.connection.dt / self.tc_plus)  # Decay
+        self.p_plus *= self._decay_plus  # Decay
         self.p_plus += a_plus * source_s  # Scaled source spikes
-        self.p_minus *= torch.exp(-self.connection.dt / self.tc_minus)  # Decay
+        self.p_minus *= self._decay_minus  # Decay
         self.p_minus += a_minus * target_s  # Scaled target spikes
 
         # Notes:
@@ -725,19 +1013,28 @@ class MSTDPET(MCC_LearningRule):
         # p_plus -> +a_plus every spike, with decay
         # p_minus -> +a_minus every spike, with decay
 
-        # Calculate point eligibility value.
-        self.eligibility = torch.outer(self.p_plus, target_s) + torch.outer(
-            source_s, self.p_minus
-        )
+        # Calculate point eligibility value (per sample).
+        self.eligibility = torch.bmm(
+            self.p_plus.unsqueeze(2), target_s.unsqueeze(1)
+        ) + torch.bmm(source_s.unsqueeze(2), self.p_minus.unsqueeze(1))
 
         super().update()
-    
+
     def reset_state_variables(self) -> None:
-        self.eligibility.zero_()
-        self.eligibility_trace.zero_()
-        self.p_plus.zero_()
-        self.p_minus.zero_()
+        # language=rst
+        """
+        Clear every variable that carries across time steps, so a new episode
+        starts from the same state as a freshly-built rule.
+        """
+
+        for state in (
+            self.eligibility,
+            self.eligibility_trace,
+            self.p_plus,
+            self.p_minus,
+        ):
+            if state is not None:
+                state.zero_()
         if self.average_update > 0:
             self.average_buffer.zero_()
             self.average_buffer_index = 0
-        return

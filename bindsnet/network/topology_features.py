@@ -1,15 +1,16 @@
+import warnings
 from abc import ABC, abstractmethod
-from bindsnet.learning.learning import NoOp
-from typing import Union, Tuple, Optional, Sequence
+from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
-import warnings
+import torch.nn as nn
+import torch.nn.functional as F
 from torch import device
 from torch.nn import Parameter
-import torch.nn.functional as F
-import torch.nn as nn
+
 import bindsnet.learning
+from bindsnet.learning.learning import NoOp
 
 
 class AbstractFeature(ABC):
@@ -17,6 +18,19 @@ class AbstractFeature(ABC):
     """
     Features to operate on signals traversing a connection.
     """
+
+    # How this feature folds in the connection's affine pipeline (see
+    # :meth:`MulticompartmentConnection.compute`): ``"mul"`` (elementwise multiply,
+    # the default), ``"add"`` or ``"sub"`` (elementwise add/subtract of the value
+    # returned by :meth:`compute`).
+    op = "mul"
+
+    # Whether :meth:`compute` returns the same value every step until the
+    # feature is mutated through the connection (learning update, normalize,
+    # reset, device move). Static-only pipelines let the connection cache the
+    # folded factors between mutations. Features whose value depends on the
+    # incoming spikes or is resampled per step must set this to ``False``.
+    is_static = True
 
     @abstractmethod
     def __init__(
@@ -40,6 +54,7 @@ class AbstractFeature(ABC):
         # language=rst
         """
         Instantiates a :code:`Feature` object. Will assign all incoming arguments as class variables
+
         :param name: Name of the feature
         :param value: Core numeric object for the feature. This parameters function will vary depending on the feature
         :param value_dtype: Data type for :code:`value` tensor
@@ -76,15 +91,19 @@ class AbstractFeature(ABC):
         self.is_primed = False
 
         from ..learning.MCC_learning import (
-            NoOp,
-            PostPre,
             MSTDP,
             MSTDPET,
+            DiehlAndCook,
+            Hebbian,
+            NoOp,
+            PostPre,
         )
 
         supported_rules = [
             NoOp,
             PostPre,
+            Hebbian,
+            DiehlAndCook,
             MSTDP,
             MSTDPET,
         ]
@@ -114,9 +133,9 @@ class AbstractFeature(ABC):
         ), "Feature {0}'s nu should be of type list or tuple, not {1}".format(
             name, type(nu)
         )
-        assert reduction is None or isinstance(
-            reduction, callable
-        ), "Feature {0}'s reduction should be of type callable, not {1}".format(
+        assert reduction is None or callable(
+            reduction
+        ), "Feature {0}'s reduction should be callable, not {1}".format(
             name, type(reduction)
         )
         assert decay is None or isinstance(
@@ -152,21 +171,26 @@ class AbstractFeature(ABC):
         else:
             return value
 
-    @abstractmethod
     def reset_state_variables(self) -> None:
         # language=rst
         """
-        Contains resetting logic for the feature.
+        Reset the feature between samples or episodes. Features that hold no
+        state of their own inherit this, which forwards the reset to the
+        feature's learning rule; a feature with its own state overrides it and
+        calls ``super()`` first.
         """
+
         if self.learning_rule:
             self.learning_rule.reset_state_variables()
-        pass
 
     @abstractmethod
-    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
+    def compute(self, s) -> Union[torch.Tensor, float, int]:
         # language=rst
         """
-        Computes the feature being operated on a set of incoming signals.
+        Return this feature's ``[source.n, target.n]`` value, given pre-synaptic
+        spikes ``s`` of shape ``[batch, source.n]``. How the value folds into the
+        connection is set by :attr:`op` -- a multiplicative factor (``"mul"``, the
+        default), or an additive/subtractive offset (``"add"``/``"sub"``).
         """
         pass
 
@@ -226,6 +250,8 @@ class AbstractFeature(ABC):
         if self.learning_rule is None:
             self.learning_rule = NoOp
 
+        # Rule-specific options given to the feature (e.g. ``x_tar``, ``mu``,
+        # ``tc_plus``) are forwarded to the rule; connection-level kwargs win.
         self.learning_rule = self.learning_rule(
             connection=connection,
             feature_value=self.value,
@@ -233,7 +259,7 @@ class AbstractFeature(ABC):
             nu=self.nu,
             reduction=self.reduction,
             decay=self.decay,
-            **kwargs,
+            **{**self.kwargs, **kwargs},
         )
 
         #### Recycle unnecessary variables ####
@@ -259,21 +285,12 @@ class AbstractFeature(ABC):
                 abs_sum = self.value.sum(1).to_dense()
                 abs_sum[abs_sum == 0] = 1.0
                 abs_sum = abs_sum.unsqueeze(1).expand(-1, *self.value.shape[1:])
-                self.value = self.value * (self.norm / abs_sum)
+                # In place: the learning rule holds this same tensor.
+                self.value.copy_(self.value * (self.norm / abs_sum))
             else:
                 abs_sum = self.value.sum(0).unsqueeze(0)
                 abs_sum[abs_sum == 0] = 1.0
                 self.value *= self.norm / abs_sum
-
-    def degrade(self) -> None:
-        # language=rst
-        """
-        Degrade the value of the propagated spikes according to the features value. A lambda function should be passed
-        into the constructor which takes a single argument (which represent the value), and returns a value which will
-        be *subtracted* from the propagated spikes.
-        """
-
-        return self.degrade(self.value)
 
     def link(self, parent_feature) -> None:
         # language=rst
@@ -381,6 +398,7 @@ class Probability(AbstractFeature):
         # language=rst
         """
         Will run a bernoulli trial using :code:`value` to determine if a signal will successfully traverse the synapse
+
         :param name: Name of the feature
         :param value: Number(s) in [0, 1] which represent the probability of a signal traversing a synapse. Tensor values
             assume that probabilities will be matched to adjacent synapses in the connection. Scalars will be applied to
@@ -422,14 +440,14 @@ class Probability(AbstractFeature):
         non_zero = values[mask]
         return torch.sparse_coo_tensor(indices, non_zero, self.value.size())
 
-    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
-        if self.sparse:
-            return conn_spikes * self.sparse_bernoulli()
-        else:
-            return conn_spikes * torch.bernoulli(self.value)
+    # Resampled every step; never cacheable.
+    is_static = False
 
-    def reset_state_variables(self) -> None:
-        pass
+    def compute(self, s) -> Union[torch.Tensor, float, int]:
+        # Factor: a fresh Bernoulli draw each step (resampled, never cached).
+        if self.sparse:
+            return self.sparse_bernoulli()
+        return torch.bernoulli(self.value)
 
     def prime_feature(self, connection, device, **kwargs) -> None:
         ## Initialize value ###
@@ -475,6 +493,7 @@ class Mask(AbstractFeature):
         # language=rst
         """
         Boolean mask which determines whether or not signals are allowed to traverse certain synapses.
+
         :param name: Name of the feature
         :param value: Boolean mask. :code:`True` means a signal can pass, :code:`False` means the synapse is impassable
         :param sparse: Should :code:`value` parameter be sparse tensor or not
@@ -504,11 +523,8 @@ class Mask(AbstractFeature):
         self.name = name
         self.value = value
 
-    def compute(self, conn_spikes) -> torch.Tensor:
-        return conn_spikes * self.value
-
-    def reset_state_variables(self) -> None:
-        pass
+    def compute(self, s) -> torch.Tensor:
+        return self.value
 
     def prime_feature(self, connection, device, **kwargs) -> None:
         # Check if feature is already primed
@@ -550,20 +566,27 @@ class Mask(AbstractFeature):
 
 
 class MeanField(AbstractFeature):
-    def __init__(self) -> None:
+    # Depends on the incoming spikes; never cacheable.
+    is_static = False
+
+    def __init__(self, name: str = "mean_field") -> None:
         # language=rst
         """
-        Takes the mean of all outgoing signals, and outputs that mean across every synapse in the connection
+        Takes the mean of each sample's incoming spikes, and outputs that mean across
+        every synapse in the connection.
+
+        :param name: Name of the feature.
         """
-        pass
+        super().__init__(name=name)
 
-    def reset_state_variables(self) -> None:
-        pass
+    def compute(self, s) -> Union[torch.Tensor, float, int]:
+        # One [source.n, target.n] factor per sample: samples do not mix.
+        mean = s.float().flatten(1).mean(1)
+        return mean.view(-1, 1, 1).expand(-1, self.source_n, self.target_n)
 
-    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
-        return conn_spikes.mean() * torch.ones(
-            self.source_n * self.target_n, device=self.device
-        )
+    def initialize_value(self):
+        # The output depends only on the spikes; the value is a placeholder.
+        return torch.ones(1)
 
     def prime_feature(self, connection, device, **kwargs) -> None:
         self.source_n = connection.source.n
@@ -588,10 +611,12 @@ class Weight(AbstractFeature):
         decay: float = 0.0,
         sparse: Optional[bool] = False,
         batch_size: int = 1,
+        **kwargs,
     ) -> None:
         # language=rst
         """
         Multiplies signals by scalars
+
         :param name: Name of the feature
         :param value: Values to scale signals by
         :param value_dtype: Data type for :code:`value` tensor
@@ -599,8 +624,10 @@ class Weight(AbstractFeature):
         :param norm: Value which all values in :code:`value` will sum to. Normalization of values occurs after each sample
             and after the value has been updated by the learning rule (if there is one)
         :param norm_frequency: How often to normalize weights:
+
             * 'sample': weights normalized after each sample
             * 'time step': weights normalized after each time step
+
         :param learning_rule: Rule which will modify the :code:`value` after each sample
         :param nu: Learning rate for the learning rule
         :param reduction: Method for reducing parameter updates along the minibatch
@@ -609,10 +636,19 @@ class Weight(AbstractFeature):
         :param decay: Constant multiple to decay weights by on each iteration
         :param sparse: Should :code:`value` parameter be sparse tensor or not
         :param batch_size: Mini-batch size.
+
+        Any further keyword arguments (e.g. ``x_tar``, ``mu``, ``tc_plus``) are
+        forwarded to the learning rule when it is instantiated.
         """
 
         self.norm_frequency = norm_frequency
         self.enforce_polarity = enforce_polarity
+        if norm_frequency == "time step":
+            # Normalization mutates ``value`` on every compute; the connection
+            # runs ``defer`` after the fold has consumed the pre-normalization
+            # value (this avoids cloning the full matrix every step).
+            self.is_static = False
+            self.defer = lambda: self.normalize(time_step_norm=True)
         super().__init__(
             name=name,
             value=value,
@@ -625,12 +661,10 @@ class Weight(AbstractFeature):
             decay=decay,
             sparse=sparse,
             batch_size=batch_size,
+            **kwargs,
         )
 
-    def reset_state_variables(self) -> None:
-        pass
-
-    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
+    def compute(self, s) -> Union[torch.Tensor, float, int]:
         if self.enforce_polarity:
             pos_mask = ~torch.logical_xor(self.value > 0, self.positive_mask)
             neg_mask = ~torch.logical_xor(self.value < 0, ~self.positive_mask)
@@ -638,11 +672,7 @@ class Weight(AbstractFeature):
             self.value[~pos_mask] = 0.0001
             self.value[~neg_mask] = -0.0001
 
-        return_val = self.value * conn_spikes
-        if self.norm_frequency == "time step":
-            self.normalize(time_step_norm=True)
-
-        return return_val
+        return self.value
 
     def prime_feature(self, connection, device, **kwargs) -> None:
         #### Initialize value ####
@@ -685,6 +715,7 @@ class Bias(AbstractFeature):
         # language=rst
         """
         Adds scalars to signals
+
         :param name: Name of the feature
         :param value: Values to add to the signals
         :param value_dtype: Data type for :code:`value` tensor
@@ -705,11 +736,12 @@ class Bias(AbstractFeature):
             batch_size=batch_size,
         )
 
-    def reset_state_variables(self) -> None:
-        pass
+    # Bias is additive: folds as ``B <- B + value`` in the connection's pipeline.
+    op = "add"
 
-    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
-        return conn_spikes + self.value
+    def compute(self, s) -> Union[torch.Tensor, float, int]:
+        # Additive offset added to every synapse (independent of the spikes).
+        return self.value
 
     def prime_feature(self, connection, device, **kwargs) -> None:
         #### Initialize value ####
@@ -733,7 +765,8 @@ class Intensity(AbstractFeature):
     ) -> None:
         # language=rst
         """
-        Adds scalars to signals
+        Multiply all signals by a scalar
+
         :param name: Name of the feature
         :param value: Values to scale signals by
         :param value_dtype: Data type for :code:`value` tensor
@@ -749,11 +782,8 @@ class Intensity(AbstractFeature):
             batch_size=batch_size,
         )
 
-    def reset_state_variables(self) -> None:
-        pass
-
-    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
-        return conn_spikes * self.value
+    def compute(self, s) -> Union[torch.Tensor, float, int]:
+        return self.value
 
     def prime_feature(self, connection, device, **kwargs) -> None:
         #### Initialize value ####
@@ -784,11 +814,12 @@ class Degradation(AbstractFeature):
         """
         Degrades propagating spikes according to :code:`degrade_function`.
         Note: If :code:`parent_feature` is provided, it will override :code:`value`.
+
         :param name: Name of the feature
         :param value: Value used to degrade feature
         :param value_dtype: Data type for :code:`value` tensor
         :param degrade_function: Callable function which takes a single argument (:code:`value`) and returns a tensor or
-        constant to be *subtracted* from the propagating spikes.
+            constant to be *subtracted* from the propagating spikes.
         :param parent_feature: Parent feature with desired :code:`value` to inherit
         :param sparse: Should :code:`value` parameter be sparse tensor or not
         :param batch_size: Mini-batch size.
@@ -806,14 +837,43 @@ class Degradation(AbstractFeature):
 
         self.degrade_function = degrade_function
 
-    def reset_state_variables(self) -> None:
-        pass
+    # Degradation is subtractive: folded as ``B <- B - degrade_function(value)``.
+    op = "sub"
 
-    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
-        return conn_spikes - self.degrade_function(self.value)
+    def compute(self, s) -> Union[torch.Tensor, float, int]:
+        # Subtractive offset (via degrade_function) applied to every synapse.
+        if self.degrade_function is not None:
+            return self.degrade_function(self.value)
+        return self.value
 
 
-class AdaptationBaseSynapsHistory(AbstractFeature):
+class _AdaptationState:
+    # The adaptation features' state besides ``value``, saved in the state_dict by
+    # MulticompartmentConnection (``feature.<name>.<key>``).
+    def extra_state_tensors(self) -> dict:
+        return {
+            "mask": self.mask,
+            "spike_buffer": self.spike_buffer,
+            "counter": torch.tensor(self.counter),
+            "start_counter": torch.tensor(self.start_counter),
+        }
+
+    def load_extra_state_tensors(self, tensors: dict) -> None:
+        for name in ("mask", "spike_buffer"):
+            if name in tensors:
+                setattr(
+                    self, name, tensors[name].clone().to(getattr(self, name).device)
+                )
+        if "counter" in tensors:
+            self.counter = int(tensors["counter"])
+        if "start_counter" in tensors:
+            self.start_counter = bool(tensors["start_counter"])
+
+
+class AdaptationBaseSynapsHistory(_AdaptationState, AbstractFeature):
+    # Value evolves with the spike history every step; never cacheable.
+    is_static = False
+
     def __init__(
         self,
         name: str,
@@ -882,7 +942,15 @@ class AdaptationBaseSynapsHistory(AbstractFeature):
             batch_size=batch_size,
         )
 
-    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
+    def compute(self, s) -> Union[torch.Tensor, float, int]:
+        # This feature needs the per-synapse spikes, so build them from s. The
+        # mask is connectivity, shared by the batch: a synapse is active when its
+        # pre-synaptic neuron spiked in any sample.
+        conn_spikes = (
+            s.view(s.size(0), -1, 1)
+            .expand(s.size(0), s.size(1), self.value.size(-1))
+            .any(0)
+        )
 
         # Update the spike buffer
         if self.start_counter == False or conn_spikes.sum() > 0:
@@ -911,19 +979,22 @@ class AdaptationBaseSynapsHistory(AbstractFeature):
             if self.sparse:
                 self.value = self.value.to_sparse()
 
-        return conn_spikes * self.value
+        return self.value
 
     def reset_state_variables(
         self,
     ):
+        super().reset_state_variables()
         self.spike_buffer = torch.zeros_like(self.spike_buffer)
         self.counter = 0
         self.start_counter = False
         self.value = self.init_value.clone().detach()  # initial mask
-        pass
 
 
-class AdaptationBaseOtherSynaps(AbstractFeature):
+class AdaptationBaseOtherSynaps(_AdaptationState, AbstractFeature):
+    # Value evolves with the spike history every step; never cacheable.
+    is_static = False
+
     def __init__(
         self,
         name: str,
@@ -992,7 +1063,15 @@ class AdaptationBaseOtherSynaps(AbstractFeature):
             batch_size=batch_size,
         )
 
-    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
+    def compute(self, s) -> Union[torch.Tensor, float, int]:
+        # This feature needs the per-synapse spikes, so build them from s. The
+        # mask is connectivity, shared by the batch: a synapse is active when its
+        # pre-synaptic neuron spiked in any sample.
+        conn_spikes = (
+            s.view(s.size(0), -1, 1)
+            .expand(s.size(0), s.size(1), self.value.size(-1))
+            .any(0)
+        )
 
         # Update the spike buffer
         if self.start_counter == False or conn_spikes.sum() > 0:
@@ -1021,16 +1100,16 @@ class AdaptationBaseOtherSynaps(AbstractFeature):
             if self.sparse:
                 self.value = self.value.to_sparse()
 
-        return conn_spikes * self.value
+        return self.value
 
     def reset_state_variables(
         self,
     ):
+        super().reset_state_variables()
         self.spike_buffer = torch.zeros_like(self.spike_buffer)
         self.counter = 0
         self.start_counter = False
         self.value = self.init_value.clone().detach()  # initial mask
-        pass
 
 
 ### Sub Features ###
@@ -1043,6 +1122,10 @@ class AbstractSubFeature(ABC):
     execution.
     """
 
+    # Runs a side effect on every step; the pipeline must never be cached
+    # around it.
+    is_static = False
+
     @abstractmethod
     def __init__(
         self,
@@ -1052,6 +1135,7 @@ class AbstractSubFeature(ABC):
         # language=rst
         """
         Instantiates a :code:`Augment` object. Will assign all incoming arguments as class variables.
+
         :param name: Name of the augment
         :param parent_feature: Primary feature which the augment will modify
         """
@@ -1060,15 +1144,31 @@ class AbstractSubFeature(ABC):
         self.parent = parent_feature
         self.sub_feature = None  # <-- Defined in non-abstract constructor
 
-    def compute(self, _) -> None:
+    def compute(self, s):
         # language=rst
         """
-        Proxy function to catch a pipeline execution from topology.py's :code:`compute` function. Allows :code:`SubFeature`
-        objects to be executed like real features in the pipeline.
+        Proxy to run a parent feature's side-effect (e.g. normalize/update) from
+        inside the pipeline. Returns ``None`` so the fold skips it entirely.
         """
 
         # sub_feature should be defined in the non-abstract constructor
         self.sub_feature()
+        return None
+
+    # The connection calls these on every pipeline entry. A sub-feature has no
+    # value of its own: its work runs in compute(), and its parent feature is
+    # primed, updated, normalized and reset as a pipeline entry itself.
+    def prime_feature(self, connection, device, **kwargs) -> None:
+        pass
+
+    def update(self, **kwargs) -> None:
+        pass
+
+    def normalize(self) -> None:
+        pass
+
+    def reset_state_variables(self) -> None:
+        pass
 
 
 class Normalization(AbstractSubFeature):
@@ -1090,8 +1190,12 @@ class Normalization(AbstractSubFeature):
 class Updating(AbstractSubFeature):
     # language=rst
     """
-    Update parent features values using the assigned update rule.
+    Update parent features values using the assigned update rule, at this entry's
+    place in the pipeline. The connection's own update then skips the parent, so it
+    learns once per step.
     """
+
+    drives_update = True
 
     def __init__(
         self,

@@ -1,0 +1,38 @@
+## What this changes and why
+
+<!-- One or two sentences. Link the issue if there is one. -->
+
+## Checklist
+
+- [ ] I ran `poetry run pytest` locally and it passed.
+- [ ] If I fixed a bug, this test fails on `master` and passes with my change
+      (checked by the `bug-test` check): `test/...::test_...`
+- [ ] I did not remove tests, remove checks, add skips or xfails, or widen
+      tolerances. If I did, I explain each one below (the `weakened-tests`
+      check lists them).
+- [ ] If I changed a formula (a neuron update, a learning rule, a connection's
+      compute), this test pins the new formula: `test/...::test_...`
+- [ ] Does this change simulated results (spikes, voltages, traces, weights)?
+      - [ ] No.
+      - [ ] Yes. I regenerated the golden files in `test/regression/` with
+            `--reason`, and explain below why the results changed. Add a
+            "Results changes" entry to `CHANGELOG.md`; see `CONTRIBUTING.md`.)
+- [ ] Did any of these files change? If yes, say which and why:
+      - golden files under `test/regression/`
+      - operation-count file under `test/regression/` (if present)
+      - `test/api_surface.json` (public API)
+      - `FIXED_BUGS` in `test/network/test_all_classes.py`
+- [ ] I added an entry to the `Unreleased` section of `CHANGELOG.md`.
+
+## AI assistance
+
+<!-- Tick exactly one box (checked by the `AI statement` check). See "AI-assisted contributions" in CONTRIBUTING.md. -->
+
+- [ ] No AI tools were used.
+- [ ] AI tools were used, and I (a human) have read every changed line, run the tests myself, and can explain the change in my own words.
+
+Tools used and for which parts:
+
+## Why the results or the API changed (if they did)
+
+<!-- Which file changed, which numbers moved, and why the new numbers are right. -->

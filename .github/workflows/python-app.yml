@@ -1,6 +1,4 @@
-# This workflow will install Python dependencies, run tests and lint with a single version of Python
-# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
-
+# Tests. Branch protection on master requires the job named "build"; keep that name.
 name: BindsNET build status
 
 on:
@@ -8,36 +6,81 @@ on:
     branches: [ master ]
   pull_request:
     branches: [ master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  POETRY_VERSION: "2.4.3"
 
 jobs:
   build:
-
+    name: build
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python 3.13
-      uses: actions/setup-python@v5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
-        python-version: 3.13
+        persist-credentials: false
     - name: Install Poetry
-      env:
-        POETRY_VERSION: 2.1.2
-      run: |
-        curl -sSL https://install.python-poetry.org | python - -y &&\
-            poetry config virtualenvs.create false
+      run: pipx install "poetry==${POETRY_VERSION}"
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: "3.13"
+        cache: poetry
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install flake8 pytest
-        # if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
         poetry install
-    - name: Lint with flake8
+        .github/scripts/use_cpu_torch.sh "poetry run python"
+    - name: Show CPU (golden files depend on pinned maths paths; test/regression/cpu_pins.py)
       run: |
-        # stop the build if there are Python syntax errors or undefined names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
-        # flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+        grep -m1 "model name" /proc/cpuinfo
+        if grep -qw avx512f /proc/cpuinfo; then echo "AVX-512 yes"; else echo "AVX-512 no"; fi
+    - name: Lint with flake8 (syntax errors and undefined names)
+      run: pipx run flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+    - name: Test with pytest (with coverage)
+      # -c and --cov-config pin the settings to pyproject.toml, so an added
+      # pytest.ini, setup.cfg, tox.ini or .coveragerc cannot change what runs.
+      run: >
+        poetry run pytest -c pyproject.toml --cov-config=pyproject.toml
+        --cov=bindsnet --cov-report=term --cov-report=xml
+    # A floor, not a target: fails only when coverage of the core packages drops
+    # below the value recorded in the script (see its docstring).
+    - name: Check coverage floor
+      run: python .github/scripts/coverage_floor.py coverage.xml
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: coverage-xml
+        path: coverage.xml
+
+  # The other supported Python versions (pyproject.toml: >=3.11,<3.14).
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install Poetry
+      run: pipx install "poetry==${POETRY_VERSION}"
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      with:
+        python-version: ${{ matrix.python-version }}
+        cache: poetry
+    - name: Install dependencies
+      run: |
+        poetry install
+        .github/scripts/use_cpu_torch.sh "poetry run python"
+    - name: Show CPU (golden files depend on pinned maths paths; test/regression/cpu_pins.py)
+      run: |
+        grep -m1 "model name" /proc/cpuinfo
+        if grep -qw avx512f /proc/cpuinfo; then echo "AVX-512 yes"; else echo "AVX-512 no"; fi
     - name: Test with pytest
-      run: |
-        pytest
+      run: poetry run pytest -c pyproject.toml

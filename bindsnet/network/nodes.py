@@ -12,6 +12,13 @@ class Nodes(torch.nn.Module):
     Abstract base class for groups of neurons.
     """
 
+    # Per-step spike clamps set by ``Network.run`` (``clamp`` / ``unclamp``
+    # keyword arguments). They are applied in ``forward`` *before* the spike
+    # traces are updated, so a forced or suppressed spike is reflected in the
+    # traces that the learning rules read. Cleared after use.
+    _clamp: Optional[torch.Tensor] = None
+    _unclamp: Optional[torch.Tensor] = None
+
     def __init__(
         self,
         n: Optional[int] = None,
@@ -93,18 +100,27 @@ class Nodes(torch.nn.Module):
 
         :param x: Inputs to the layer.
         """
+        # Force / suppress spikes requested for this step (see ``Network.run``),
+        # before the traces below see ``self.s``.
+        if self._clamp is not None:
+            self.s[:, self._clamp] = 1
+            self._clamp = None
+        if self._unclamp is not None:
+            self.s[:, self._unclamp] = 0
+            self._unclamp = None
+
         if self.traces:
             # Decay and set spike traces.
-            self.x *= self.trace_decay
+            self.x.mul_(self.trace_decay)
 
             if self.traces_additive:
-                self.x += self.trace_scale * self.s.float()
+                self.x.add_(self.trace_scale * self.s.float())
             else:
                 self.x.masked_fill_(self.s.bool(), self.trace_scale)
 
         if self.sum_input:
             # Add current input to running sum.
-            self.summed += x.float()
+            self.summed.add_(x.float())
 
     def reset_state_variables(self) -> None:
         # language=rst
@@ -376,10 +392,10 @@ class IFNodes(Nodes):
         :param x: Inputs to the layer.
         """
         # Integrate input voltages.
-        self.v += (self.refrac_count <= 0).float() * x
+        self.v.add_((self.refrac_count <= 0).float() * x)
 
         # Decrement refractory counters.
-        self.refrac_count -= self.dt
+        self.refrac_count.sub_(self.dt)
 
         # Check for spiking neurons.
         self.s = self.v >= self.thresh
@@ -505,15 +521,17 @@ class LIFNodes(Nodes):
         :param x: Inputs to the layer.
         """
         # Decay voltages.
-        self.v = self.decay * (self.v - self.rest) + self.rest
+        # In place: same three operations in the same order as
+        # ``decay * (v - rest) + rest`` (bit-identical), without the temporaries.
+        self.v.sub_(self.rest).mul_(self.decay).add_(self.rest)
 
         # Integrate inputs.
         x.masked_fill_(self.refrac_count > 0, 0.0)
 
         # Decrement refractory counters.
-        self.refrac_count -= self.dt
+        self.refrac_count.sub_(self.dt)
 
-        self.v += x  # interlaced
+        self.v.add_(x)  # interlaced
 
         # Check for spiking neurons.
         self.s = self.v >= self.thresh
@@ -626,17 +644,17 @@ class BoostedLIFNodes(Nodes):
         :param x: Inputs to the layer.
         """
         # Decay voltages.
-        self.v *= self.decay
+        self.v.mul_(self.decay)
 
         # Integrate inputs.
         if x is not None:
             x.masked_fill_(self.refrac_count > 0, 0.0)
 
         # Decrement refractory counters.
-        self.refrac_count -= self.dt
+        self.refrac_count.sub_(self.dt)
 
         if x is not None:
-            self.v += x
+            self.v.add_(x)
 
         # Check for spiking neurons.
         self.s = self.v >= self.thresh
@@ -767,15 +785,17 @@ class CurrentLIFNodes(Nodes):
         :param x: Inputs to the layer.
         """
         # Decay voltages and current.
-        self.v = self.decay * (self.v - self.rest) + self.rest
-        self.i *= self.i_decay
+        # In place: same three operations in the same order as
+        # ``decay * (v - rest) + rest`` (bit-identical), without the temporaries.
+        self.v.sub_(self.rest).mul_(self.decay).add_(self.rest)
+        self.i.mul_(self.i_decay)
 
         # Decrement refractory counters.
-        self.refrac_count -= self.dt
+        self.refrac_count.sub_(self.dt)
 
         # Integrate inputs.
-        self.i += x
-        self.v += (self.refrac_count <= 0).float() * self.i
+        self.i.add_(x)
+        self.v.add_((self.refrac_count <= 0).float() * self.i)
 
         # Check for spiking neurons.
         self.s = self.v >= self.thresh
@@ -919,15 +939,17 @@ class AdaptiveLIFNodes(Nodes):
         :param x: Inputs to the layer.
         """
         # Decay voltages and adaptive thresholds.
-        self.v = self.decay * (self.v - self.rest) + self.rest
+        # In place: same three operations in the same order as
+        # ``decay * (v - rest) + rest`` (bit-identical), without the temporaries.
+        self.v.sub_(self.rest).mul_(self.decay).add_(self.rest)
         if self.learning:
-            self.theta *= self.theta_decay
+            self.theta.mul_(self.theta_decay)
 
         # Integrate inputs.
-        self.v += (self.refrac_count <= 0).float() * x
+        self.v.add_((self.refrac_count <= 0).float() * x)
 
         # Decrement refractory counters.
-        self.refrac_count -= self.dt
+        self.refrac_count.sub_(self.dt)
 
         # Check for spiking neurons.
         self.s = self.v >= self.thresh + self.theta
@@ -936,7 +958,7 @@ class AdaptiveLIFNodes(Nodes):
         self.refrac_count.masked_fill_(self.s, self.refrac)
         self.v.masked_fill_(self.s, self.reset)
         if self.learning:
-            self.theta += self.theta_plus * self.s.float().sum(0)
+            self.theta.add_(self.theta_plus * self.s.float().sum(0))
 
         # voltage clipping to lowerbound
         if self.lbound is not None:
@@ -1074,15 +1096,17 @@ class DiehlAndCookNodes(Nodes):
         :param x: Inputs to the layer.
         """
         # Decay voltages and adaptive thresholds.
-        self.v = self.decay * (self.v - self.rest) + self.rest
+        # In place: same three operations in the same order as
+        # ``decay * (v - rest) + rest`` (bit-identical), without the temporaries.
+        self.v.sub_(self.rest).mul_(self.decay).add_(self.rest)
         if self.learning:
-            self.theta *= self.theta_decay
+            self.theta.mul_(self.theta_decay)
 
         # Integrate inputs.
-        self.v += (self.refrac_count <= 0).float() * x
+        self.v.add_((self.refrac_count <= 0).float() * x)
 
         # Decrement refractory counters.
-        self.refrac_count -= self.dt
+        self.refrac_count.sub_(self.dt)
 
         # Check for spiking neurons.
         self.s = self.v >= self.thresh + self.theta
@@ -1091,7 +1115,7 @@ class DiehlAndCookNodes(Nodes):
         self.refrac_count.masked_fill_(self.s, self.refrac)
         self.v.masked_fill_(self.s, self.reset)
         if self.learning:
-            self.theta += self.theta_plus * self.s.float().sum(0)
+            self.theta.add_(self.theta_plus * self.s.float().sum(0))
 
         # Choose only a single neuron to spike.
         if self.one_spike:
@@ -1147,7 +1171,7 @@ class DiehlAndCookNodes(Nodes):
 class IzhikevichNodes(Nodes):
     # language=rst
     """
-    Layer of `Izhikevich neurons<https://www.izhikevich.org/publications/spikes.htm>`_.
+    Layer of `Izhikevich neurons <https://www.izhikevich.org/publications/spikes.htm>`_.
     """
 
     def __init__(
@@ -1209,37 +1233,37 @@ class IzhikevichNodes(Nodes):
             excitatory = 0
 
         if excitatory == 1:
-            self.r = torch.rand(n)
-            self.a = 0.02 * torch.ones(n)
-            self.b = 0.2 * torch.ones(n)
+            self.r = torch.rand(self.n)
+            self.a = 0.02 * torch.ones(self.n)
+            self.b = 0.2 * torch.ones(self.n)
             self.c = -65.0 + 15 * (self.r**2)
             self.d = 8 - 6 * (self.r**2)
-            self.S = 0.5 * torch.rand(n, n)
-            self.excitatory = torch.ones(n).byte()
+            self.S = 0.5 * torch.rand(self.n, self.n)
+            self.excitatory = torch.ones(self.n).byte()
 
         elif excitatory == 0:
-            self.r = torch.rand(n)
+            self.r = torch.rand(self.n)
             self.a = 0.02 + 0.08 * self.r
             self.b = 0.25 - 0.05 * self.r
-            self.c = -65.0 * torch.ones(n)
-            self.d = 2 * torch.ones(n)
-            self.S = -torch.rand(n, n)
+            self.c = -65.0 * torch.ones(self.n)
+            self.d = 2 * torch.ones(self.n)
+            self.S = -torch.rand(self.n, self.n)
 
-            self.excitatory = torch.zeros(n).byte()
+            self.excitatory = torch.zeros(self.n).byte()
 
         else:
-            self.excitatory = torch.zeros(n).byte()
+            self.excitatory = torch.zeros(self.n).byte()
 
-            ex = int(n * excitatory)
-            inh = n - ex
+            ex = int(self.n * excitatory)
+            inh = self.n - ex
 
             # init
-            self.r = torch.zeros(n)
-            self.a = torch.zeros(n)
-            self.b = torch.zeros(n)
-            self.c = torch.zeros(n)
-            self.d = torch.zeros(n)
-            self.S = torch.zeros(n, n)
+            self.r = torch.zeros(self.n)
+            self.a = torch.zeros(self.n)
+            self.b = torch.zeros(self.n)
+            self.c = torch.zeros(self.n)
+            self.d = torch.zeros(self.n)
+            self.S = torch.zeros(self.n, self.n)
 
             # excitatory
             self.r[:ex] = torch.rand(ex)
@@ -1247,7 +1271,7 @@ class IzhikevichNodes(Nodes):
             self.b[:ex] = 0.2 * torch.ones(ex)
             self.c[:ex] = -65.0 + 15 * self.r[:ex] ** 2
             self.d[:ex] = 8 - 6 * self.r[:ex] ** 2
-            self.S[:, :ex] = 0.5 * torch.rand(n, ex)
+            self.S[:, :ex] = 0.5 * torch.rand(self.n, ex)
             self.excitatory[:ex] = 1
 
             # inhibitory
@@ -1256,10 +1280,15 @@ class IzhikevichNodes(Nodes):
             self.b[ex:] = 0.25 - 0.05 * self.r[ex:]
             self.c[ex:] = -65.0 * torch.ones(inh)
             self.d[ex:] = 2 * torch.ones(inh)
-            self.S[:, ex:] = -torch.rand(n, inh)
+            self.S[:, ex:] = -torch.rand(self.n, inh)
             self.excitatory[ex:] = 0
 
-        self.register_buffer("v", self.rest * torch.ones(n))  # Neuron voltages.
+        # Per-neuron parameters take the layer's shape; S stays [n, n] over the
+        # flattened neurons.
+        for name in ("r", "a", "b", "c", "d", "excitatory"):
+            setattr(self, name, getattr(self, name).view(*self.shape))
+
+        self.register_buffer("v", self.rest * torch.ones(*self.shape))  # Voltages.
         self.register_buffer("u", self.b * self.v)  # Neuron recovery.
 
     def forward(self, x: torch.Tensor) -> None:
@@ -1276,15 +1305,16 @@ class IzhikevichNodes(Nodes):
 
         # Add inter-columnar input.
         if self.s.any():
+            s = self.s.view(self.s.size(0), -1)
             x += torch.cat(
-                [self.S[:, self.s[i]].sum(dim=1)[None] for i in range(self.s.shape[0])],
+                [self.S[:, s[i]].sum(dim=1)[None] for i in range(s.size(0))],
                 dim=0,
-            )
+            ).view_as(x)
 
         # Apply v and u updates.
-        self.v += self.dt * 0.5 * (0.04 * self.v**2 + 5 * self.v + 140 - self.u + x)
-        self.v += self.dt * 0.5 * (0.04 * self.v**2 + 5 * self.v + 140 - self.u + x)
-        self.u += self.dt * self.a * (self.b * self.v - self.u)
+        self.v.add_(self.dt * 0.5 * (0.04 * self.v**2 + 5 * self.v + 140 - self.u + x))
+        self.v.add_(self.dt * 0.5 * (0.04 * self.v**2 + 5 * self.v + 140 - self.u + x))
+        self.u.add_(self.dt * self.a * (self.b * self.v - self.u))
 
         # Voltage clipping to lower bound.
         if self.lbound is not None:
@@ -1432,25 +1462,25 @@ class CSRMNodes(Nodes):
         :param x: Inputs to the layer.
         """
         # Decay voltages.
-        self.v *= self.decay
+        self.v.mul_(self.decay)
 
         if self.learning:
-            self.theta *= self.theta_decay
+            self.theta.mul_(self.theta_decay)
 
         # Integrate inputs.
         v = torch.einsum(
-            "i,kij->kj", self.resKernel, x
+            "i,ki...->k...", self.resKernel, x
         )  # Response due to incoming current
         v += torch.einsum(
-            "i,kij->kj", self.refKernel, self.last_spikes
+            "i,ki...->k...", self.refKernel, self.last_spikes
         )  # Refractoriness due to previous spikes
-        self.v += v.view(x.size(0), *self.shape)
+        self.v.add_(v.view(x.size(0), *self.shape))
 
         # Check for spiking neurons.
         self.s = self.v >= self.thresh + self.theta
 
         if self.learning:
-            self.theta += self.theta_plus * self.s.float().sum(0)
+            self.theta.add_(self.theta_plus * self.s.float().sum(0))
 
         # Add the spike vector into the first in first out matrix of windowed (ref) spike trains
         self.last_spikes = torch.cat(
@@ -1470,6 +1500,7 @@ class CSRMNodes(Nodes):
         """
         super().reset_state_variables()
         self.v.fill_(self.rest)  # Neuron voltages.
+        self.last_spikes.zero_()  # Spikes in the refractory window.
 
     def compute_decays(self, dt) -> None:
         # language=rst
@@ -1644,10 +1675,12 @@ class SRM0Nodes(Nodes):
         :param x: Inputs to the layer.
         """
         # Decay voltages.
-        self.v = self.decay * (self.v - self.rest) + self.rest
+        # In place: same three operations in the same order as
+        # ``decay * (v - rest) + rest`` (bit-identical), without the temporaries.
+        self.v.sub_(self.rest).mul_(self.decay).add_(self.rest)
 
         # Integrate inputs.
-        self.v += (self.refrac_count <= 0).float() * self.eps_0 * x
+        self.v.add_((self.refrac_count <= 0).float() * self.eps_0 * x)
 
         # Compute (instantaneous) probabilities of spiking, clamp between 0 and 1 using exponentials.
         # Also known as 'escape noise', this simulates nearby neurons.
@@ -1655,7 +1688,7 @@ class SRM0Nodes(Nodes):
         self.s_prob = 1.0 - torch.exp(-self.rho * self.dt)
 
         # Decrement refractory counters.
-        self.refrac_count -= self.dt
+        self.refrac_count.sub_(self.dt)
 
         # Check for spiking neurons (spike when probability > some random number).
         self.s = torch.rand_like(self.s_prob) < self.s_prob
