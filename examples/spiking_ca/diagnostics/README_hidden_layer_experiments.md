@@ -202,3 +202,23 @@ Nature 391:892 to 896.
 
 Zambrano D, Nusselder R, Scholte HS, Bohté SM (2018). Sparse computation
 in adaptive spiking neural networks. Frontiers in Neuroscience 12:987.
+
+## Drift checks and hidden layer variants (Nov 2026)
+
+All numbers use the batch fix (input [1, 256, 54]), the power 3 encoder, channel 0 restored every CA step, 150 states per seed and the two pole angle cells. One standard error is about 0.04 per seed. Results and figures are in `results_nov2026/`.
+
+Scripts:
+
+- `drift_checks.py <seed> A|B [n_states]`: A is delta 0.02 for 10 steps (check 3 weight scaling, check 1 per cell drift), B is delta 0.005 for 24 steps (check 2).
+- `voltage_reset.py <seed> A [n_states] none|probe|traj`: compares resetting only spikes, resetting voltage before every probe, and resetting voltage only at the start of each state.
+- `step10_variants.py <variant> <seed> [n_states]`: hidden layer variants inside the CA loop. Variants: base, lateral5, shared_theta, percell_theta, percell_theta_small, hetero_decay, percell_double, bal<g> (balanced inhibition, g is the fraction of the mean excitation cancelled), wnorm<target>[@speed] (weight normalization), and combinations joined with +. Includes `PerCellAdaptiveLIFNodes`, an adaptive threshold with theta of shape [batch, n] (BindsNET's version sums spikes over the batch, so one cell's spike raises every cell's threshold).
+- `run_all_variants.sh`, `final_summary.py`: batch runner and summary table / figure.
+
+Findings:
+
+- The angle stays decodable in the input layer but the hidden layer loses it as the CA runs. Accuracy falls with how far the 53 other inputs have moved, at delta 0.02 and 0.005 alike.
+- Scaling the hidden weights to keep spikes per unit constant does not restore accuracy, so the cause is variable input content, not total activity.
+- Only about 16 to 19 percent of the drift is shared by all cells. Most of it is cell specific.
+- Resetting voltage to rest makes no difference within noise.
+- Step 10 accuracy: baseline 0.65 (8 seeds), weight norm with target 3.2 to 4.5 about 0.72, balanced inhibition at 15 to 25 percent about 0.68 to 0.70 (it silences the layer above 30 percent), combinations no better than weight norm alone, per cell theta, heterogeneous decay and double adaptation no better than baseline. The input layer is 0.82.
+- `ca_model.py` no longer overrides `MSTDPET.reset_state_variables`. Upstream's version already clears p_plus, p_minus and the average buffer, and the baseline is identical to every digit with the patch removed.

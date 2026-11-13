@@ -1,0 +1,26 @@
+variant                             n  step0  step10     SE  vs base     SE  hid10
+Weight norm target 3.8              4  0.785   0.728  0.032   +0.087  0.038   4.72
+Weight norm target 3.2              8  0.746   0.724  0.019   +0.077  0.026   4.65
+Weight norm target 3.2, speed 0.1   4  0.825   0.723  0.032   +0.082  0.028   4.55
+Weight norm target 3.2, speed 0.4   4  0.803   0.717  0.032   +0.075  0.038   4.74
+Weight norm target 4.5              4  0.777   0.715  0.027   +0.073  0.024   4.74
+Balanced inhibition 25%             8  0.622   0.700  0.027   +0.052  0.023   0.81
+Balanced inhibition 20%             8  0.637   0.692  0.024   +0.045  0.029   1.50
+Balanced inhibition 20% + Weight norm target 3.2  8  0.654   0.684  0.019   +0.037  0.025   4.79
+Balanced inhibition 15%             8  0.692   0.681  0.020   +0.033  0.022   2.18
+Weight norm target 2.0              8  0.744   0.680  0.028   +0.033  0.024   4.32
+Lateral inhibition 5.0              8  0.608   0.679  0.025   +0.032  0.019   1.09
+Per cell double adaptation          8  0.741   0.667  0.016   +0.019  0.019   3.19
+Balanced inhibition 10%             3  0.760   0.664  0.039   +0.049  0.014   2.97
+Weight norm target 2.6              4  0.763   0.660  0.054   +0.018  0.050   4.59
+Balanced inhibition 15% + Weight norm target 3.2  8  0.699   0.654  0.026   +0.007  0.027   4.77
+Per cell theta, small               8  0.757   0.650  0.014   +0.003  0.014   3.24
+Baseline                            8  0.725   0.647  0.018   +0.000  0.000   3.58
+Heterogeneous decay                 8  0.732   0.644  0.018   -0.003  0.033   3.71
+Balanced inhibition 25% + Weight norm target 3.2  8  0.613   0.634  0.024   -0.013  0.018   4.81
+Balanced inhibition 30%             3  0.616   0.624  0.051   +0.009  0.049   0.50
+Balanced inhibition 35%             3  0.540   0.609  0.046   -0.007  0.023   0.23
+Per cell theta                      3  0.771   0.600  0.021   -0.016  0.042   2.78
+Balanced inhibition 50%             3  0.500   0.600  0.064   -0.016  0.071   0.02
+Shared theta                        3  0.747   0.573  0.021   -0.042  0.039   0.48
+Balanced inhibition 40%             3  0.527   0.531  0.015   -0.084  0.012   0.12

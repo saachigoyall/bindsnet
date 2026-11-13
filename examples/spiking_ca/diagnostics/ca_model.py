@@ -25,19 +25,6 @@ from bindsnet.encoding import PoissonEncoder
 from bindsnet.learning.MCC_learning import MSTDPET as MCC_MSTDPET
 
 
-def _patched_reset_state_variables(self) -> None:
-    self.eligibility.zero_()
-    self.eligibility_trace.zero_()
-    self.p_plus.zero_()
-    self.p_minus.zero_()
-    if self.average_update > 0:
-        self.average_buffer.zero_()
-        self.average_buffer_index = 0
-    return
-MCC_MSTDPET.reset_state_variables = _patched_reset_state_variables
-print('Patched MCC_MSTDPET.reset_state_variables')
-
-
 GRID_SIZE = 16
 NUM_CHANNELS = 6
 TRACK_HALF_LEN = 2.4
